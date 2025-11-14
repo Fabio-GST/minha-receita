@@ -58,6 +58,12 @@ func downloadNationalTreasure(dir string, skip bool) error {
 
 // Download all the files (might take hours).
 func Download(dir string, timeout time.Duration, skip, restart bool, parallel int, retries uint, chunkSize int64) error {
+	return DownloadFiltered(dir, timeout, skip, restart, parallel, retries, chunkSize, nil)
+}
+
+// DownloadFiltered downloads files with optional filtering.
+// If filter is nil, downloads all files. Otherwise, only downloads files whose names contain any of the filter strings.
+func DownloadFiltered(dir string, timeout time.Duration, skip, restart bool, parallel int, retries uint, chunkSize int64, filter []string) error {
 	slog.Info("Downloading file(s) from the National Treasure…")
 	if err := downloadNationalTreasure(dir, skip); err != nil {
 		return fmt.Errorf("error downloading files from the national treasure: %w", err)
@@ -67,7 +73,25 @@ func Download(dir string, timeout time.Duration, skip, restart bool, parallel in
 	if err != nil {
 		return fmt.Errorf("error gathering resources for download: %w", err)
 	}
+	
+	// Filter URLs if filter is provided
+	if filter != nil && len(filter) > 0 {
+		var filtered []string
+		for _, url := range urls {
+			fileName := filepath.Base(url)
+			for _, f := range filter {
+				if strings.Contains(strings.ToLower(fileName), strings.ToLower(f)) {
+					filtered = append(filtered, url)
+					break
+				}
+			}
+		}
+		urls = filtered
+		slog.Info(fmt.Sprintf("Filtered to %d files matching: %v", len(urls), filter))
+	}
+	
 	if len(urls) == 0 {
+		slog.Warn("No files to download after filtering")
 		return nil
 	}
 	if err := download(dir, urls, parallel, retries, chunkSize, timeout, restart); err != nil {

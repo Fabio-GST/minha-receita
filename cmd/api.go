@@ -50,6 +50,7 @@ var apiCmd = &cobra.Command{
 }
 
 func apiCLI() *cobra.Command {
+	apiCmd = addDatabase(apiCmd)
 	apiCmd.Flags().StringVarP(
 		&port,
 		"port",

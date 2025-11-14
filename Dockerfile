@@ -12,8 +12,11 @@ LABEL org.opencontainers.image.description="Sua API web para consulta de informa
 LABEL org.opencontainers.image.source="https://github.com/cuducos/minha-receita"
 LABEL org.opencontainers.image.title="Minha Receita"
 
-RUN apt-get update && \
+RUN echo 'APT::Get::AllowUnauthenticated "true";' > /etc/apt/apt.conf.d/99allow-unauth && \
+    apt-get update --allow-releaseinfo-change && \
     apt-get install -y --no-install-recommends ca-certificates && \
+    rm /etc/apt/apt.conf.d/99allow-unauth && \
+    apt-get update && \
     update-ca-certificates && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*

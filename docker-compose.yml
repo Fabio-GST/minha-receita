@@ -8,6 +8,13 @@ services:
       - .env
     volumes:
       - ./data:/mnt/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgres://minhareceita:minhareceita@postgres:5432/minhareceita?sslmode=disable}
 
   postgres:
     image: postgres:16.1-bookworm

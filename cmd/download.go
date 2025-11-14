@@ -38,6 +38,7 @@ var (
 	skipExistingFiles bool
 	restart           bool
 	deleteZipFiles    bool
+	downloadFilter    []string
 )
 
 var downloadCmd = &cobra.Command{
@@ -51,6 +52,9 @@ var downloadCmd = &cobra.Command{
 		dur, err := time.ParseDuration(timeout)
 		if err != nil {
 			return err
+		}
+		if len(downloadFilter) > 0 {
+			return download.DownloadFiltered(dir, dur, skipExistingFiles, restart, parallelDownloads, downloadRetries, chunkSize, downloadFilter)
 		}
 		return download.Download(dir, dur, skipExistingFiles, restart, parallelDownloads, downloadRetries, chunkSize)
 	},
@@ -90,6 +94,7 @@ func downloadCLI() *cobra.Command {
 	downloadCmd.Flags().IntVarP(&parallelDownloads, "parallel", "p", download.DefaultMaxParallel, "maximum parallel downloads")
 	downloadCmd.Flags().Int64VarP(&chunkSize, "chunk-size", "c", download.DefaultChunkSize, "max length of the bytes range for each HTTP request")
 	downloadCmd.Flags().BoolVarP(&restart, "restart", "e", false, "restart all downloads from the beginning")
+	downloadCmd.Flags().StringSliceVarP(&downloadFilter, "only", "o", []string{}, "only download files containing these strings (e.g., --only Estabelecimentos --only Empresas --only Socios)")
 	return downloadCmd
 }
 

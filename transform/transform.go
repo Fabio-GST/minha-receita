@@ -37,6 +37,7 @@ var extraIdexes = [...]string{
 type database interface {
 	PreLoad() error
 	CreateCompanies([][]string) error
+	CreateCompaniesStructured([][]string) error
 	PostLoad() error
 	CreateExtraIndexes([]string) error
 	MetaSave(string, string) error
@@ -75,7 +76,7 @@ func createKeyValueStorage(dir string, pth string, l lookups, maxKV int) (err er
 	return nil
 }
 
-func createJSONs(dir string, pth string, db database, l lookups, maxDB, batchSize int, privacy bool) error {
+func createJSONs(dir string, pth string, db database, l lookups, maxDB, batchSize int, privacy bool, structured bool) error {
 	kv, err := newBadgerStorage(pth, true)
 	if err != nil {
 		return fmt.Errorf("could not create badger storage: %w", err)
@@ -85,7 +86,7 @@ func createJSONs(dir string, pth string, db database, l lookups, maxDB, batchSiz
 			slog.Warn("could not close key-value storage", "path", pth, "error", err)
 		}
 	}()
-	j, err := createJSONRecordsTask(dir, db, &l, kv, batchSize, privacy)
+	j, err := createJSONRecordsTask(dir, db, &l, kv, batchSize, privacy, structured)
 	if err != nil {
 		return fmt.Errorf("error creating new task for venues in %s: %w", dir, err)
 	}
@@ -111,7 +112,7 @@ func postLoad(db database) error {
 
 // Transform the downloaded files for company venues creating a database record
 // per CNPJ
-func Transform(dir string, db database, maxDB, maxKV, s int, p bool) error {
+func Transform(dir string, db database, maxDB, maxKV, s int, p bool, structured bool) error {
 	pth, err := os.MkdirTemp("", fmt.Sprintf("minha-receita-%s-*", time.Now().Format("20060102150405")))
 	if err != nil {
 		return fmt.Errorf("error creating temporary key-value storage: %w", err)
@@ -128,7 +129,7 @@ func Transform(dir string, db database, maxDB, maxKV, s int, p bool) error {
 	if err := createKeyValueStorage(dir, pth, l, 1024); err != nil {
 		return err
 	}
-	if err := createJSONs(dir, pth, db, l, maxDB, s, p); err != nil {
+	if err := createJSONs(dir, pth, db, l, maxDB, s, p, structured); err != nil {
 		return err
 	}
 	return postLoad(db)

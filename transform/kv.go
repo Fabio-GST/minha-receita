@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -247,7 +248,11 @@ func (*noLogger) Infof(string, ...any)    {}
 func (*noLogger) Debugf(string, ...any)   {}
 
 func newBadgerStorage(dir string, ro bool) (*badgerStorage, error) {
-	opt := badger.DefaultOptions(dir).WithReadOnly(ro)
+	opt := badger.DefaultOptions(dir)
+	// Badger read-only mode is not supported on Windows
+	if ro && runtime.GOOS != "windows" {
+		opt = opt.WithReadOnly(ro)
+	}
 	slog.Debug("Creating temporary key-value storage", "path", dir)
 	if os.Getenv("DEBUG") == "" {
 		opt = opt.WithLogger(&noLogger{})

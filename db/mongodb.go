@@ -85,6 +85,11 @@ func (m *MongoDB) Drop() error {
 	return nil
 }
 
+// CreateCompaniesStructured is not supported for MongoDB (relational structure required)
+func (m *MongoDB) CreateCompaniesStructured(batch [][]string) error {
+	return fmt.Errorf("CreateCompaniesStructured is not supported for MongoDB - use PostgreSQL for structured tables")
+}
+
 // CreateCompanies writes a batch of company data to MongoDB
 func (m *MongoDB) CreateCompanies(batch [][]string) error {
 	if m == nil {

@@ -21,6 +21,7 @@ type database interface {
 	// transform
 	PreLoad() error
 	CreateCompanies([][]string) error
+	CreateCompaniesStructured([][]string) error
 	PostLoad() error
 	MetaSave(string, string) error
 	// extra indexes

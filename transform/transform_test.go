@@ -42,6 +42,11 @@ func (i inMemoryDB) CreateCompanies(cs [][]string) error {
 	return nil
 }
 
+func (i inMemoryDB) CreateCompaniesStructured(cs [][]string) error {
+	// For testing purposes, structured mode works the same as regular mode
+	return i.CreateCompanies(cs)
+}
+
 func (i inMemoryDB) MetaSave(k, v string) error {
 	i.meta.lock.Lock()
 	defer i.meta.lock.Unlock()

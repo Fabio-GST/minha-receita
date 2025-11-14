@@ -11,13 +11,14 @@ import (
 )
 
 type venuesTask struct {
-	source    *source
-	lookups   *lookups
-	kv        kvStorage
-	privacy   bool
-	dir       string
-	db        database
-	batchSize int
+	source     *source
+	lookups    *lookups
+	kv         kvStorage
+	privacy    bool
+	structured bool
+	dir        string
+	db         database
+	batchSize  int
 }
 
 func (t *venuesTask) saveBatch(b []Company) (int, error) {
@@ -32,7 +33,13 @@ func (t *venuesTask) saveBatch(b []Company) (int, error) {
 		}
 		s[i] = []string{c.CNPJ, j}
 	}
-	if err := t.db.CreateCompanies(s); err != nil {
+	var err error
+	if t.structured {
+		err = t.db.CreateCompaniesStructured(s)
+	} else {
+		err = t.db.CreateCompanies(s)
+	}
+	if err != nil {
 		return 0, fmt.Errorf("error saving companies: %w", err)
 	}
 	return len(s), nil
@@ -148,19 +155,20 @@ func (t *venuesTask) run(m int) error {
 	}
 }
 
-func createJSONRecordsTask(dir string, db database, l *lookups, kv kvStorage, b int, p bool) (*venuesTask, error) {
+func createJSONRecordsTask(dir string, db database, l *lookups, kv kvStorage, b int, p bool, structured bool) (*venuesTask, error) {
 	v, err := newSource(context.Background(), venues, dir)
 	if err != nil {
 		return nil, fmt.Errorf("error creating a source for venues from %s: %w", dir, err)
 	}
 	t := venuesTask{
-		source:    v,
-		lookups:   l,
-		kv:        kv,
-		privacy:   p,
-		dir:       dir,
-		db:        db,
-		batchSize: b,
+		source:     v,
+		lookups:    l,
+		kv:         kv,
+		privacy:    p,
+		structured: structured,
+		dir:        dir,
+		db:         db,
+		batchSize:  b,
 	}
 	return &t, nil
 }

@@ -32,6 +32,9 @@ type database interface {
 	GetCompany(string) (string, error)
 	Search(context.Context, *db.Query) (string, error)
 	MetaRead(string) (string, error)
+	// partners import
+	ImportPartnersOnly([]transform.PartnerData, string) error
+	ImportPartnersBatch(map[string][]transform.PartnerData) error
 }
 
 func loadDatabase() (database, error) {

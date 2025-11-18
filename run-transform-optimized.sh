@@ -1,5 +1,6 @@
 #!/bin/bash
-# Script otimizado para executar transform com uso reduzido de memória
+# Script otimizado para executar transform com uso reduzido de espaço em disco
+# Otimizado para ambientes com espaço limitado (ex: 23GB disponíveis)
 
 cd /root/minha-receita
 
@@ -9,14 +10,17 @@ export $(cat .env | xargs)
 # Configurar limite de memória do Go (6GB de 8GB disponíveis)
 export GOMEMLIMIT=6GiB
 
-# Executar com parâmetros otimizados para reduzir uso de memória
-# -m 2: reduz workers paralelos de DB para 2
-# -k 128: reduz writes paralelos KV para 128
-# -b 1024: reduz batch size para 1024
+# Executar com parâmetros otimizados para reduzir uso de espaço em disco:
+# -m 1: apenas 1 query paralela ao DB (evita múltiplas transações grandes simultâneas)
+#       Reduz uso de espaço temporário durante transações
+# -k 64: reduz writes paralelos KV para 64 (suficiente para HDD/SSD, reduz memória)
+# -b 256: batch size reduzido para 256 registros (menos registros por transação)
+#         Transações menores = menos espaço temporário necessário
+#         Commits mais frequentes = libera espaço mais rápido
 nohup go run main.go transform --structured \
-  --max-parallel-db-queries 2 \
-  --max-parallel-kv-writes 128 \
-  --batch-size 1024 \
+  --max-parallel-db-queries 1 \
+  --max-parallel-kv-writes 64 \
+  --batch-size 256 \
   > transform.log 2>&1 &
 
 echo "Processo iniciado em background (PID: $!)"

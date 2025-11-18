@@ -85,16 +85,27 @@ func (a *archivedCSVs) sendTo(ctx context.Context, ch chan<- []string) error {
 		for {
 			row, err := a.read()
 			if err != nil {
-				e <- err
+				if err == io.EOF {
+					e <- io.EOF
+				} else {
+					e <- err
+				}
 				return
 			}
-			ch <- row
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- row:
+			}
 		}
 	}()
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-e:
+		if err == io.EOF {
+			return io.EOF
+		}
 		return err
 	}
 }

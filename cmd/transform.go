@@ -76,3 +76,39 @@ func transformCLI() *cobra.Command {
 	transformCmd.Flags().BoolVarP(&structured, "structured", "", structured, "save data to structured tables (business and business_partners) instead of JSON table")
 	return transformCmd
 }
+
+const importPartnersHelper = `
+Import only partners data from Socios CSV files into socios_cnpj table.
+This command reads Socios files and inserts partners directly into the database,
+requiring that the business table already exists with the corresponding CNPJs.
+`
+
+var importPartnersCmd = &cobra.Command{
+	Use:   "import-partners",
+	Short: "Imports only partners data from Socios CSV files",
+	Long:  importPartnersHelper,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		if err := assertDirExists(); err != nil {
+			return err
+		}
+		db, err := loadDatabase()
+		if err != nil {
+			return fmt.Errorf("could not find database: %w", err)
+		}
+		defer db.Close()
+		return transform.TransformPartnersOnly(dir, db, maxParallelDBQueries)
+	},
+}
+
+func importPartnersCLI() *cobra.Command {
+	importPartnersCmd = addDataDir(importPartnersCmd)
+	importPartnersCmd = addDatabase(importPartnersCmd)
+	importPartnersCmd.Flags().IntVarP(
+		&maxParallelDBQueries,
+		"max-parallel-db-queries",
+		"m",
+		transform.MaxParallelDBQueries,
+		"maximum parallel database queries",
+	)
+	return importPartnersCmd
+}

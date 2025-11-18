@@ -136,7 +136,8 @@ func (t *venuesTask) run(m int) error {
 		}
 	}()
 	var g errgroup.Group
-	q := make(chan []string)
+	// Buffer de 500 linhas para evitar bloqueios sem usar muita memória
+	q := make(chan []string, 500)
 	g.Go(func() error {
 		if err := t.source.sendTo(ctx, q); err != nil {
 			return fmt.Errorf("error reading %s: %w", t.source.kind, err)

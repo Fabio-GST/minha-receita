@@ -90,6 +90,9 @@ func (kv *badgerStorage) garbageCollect() {
 	}
 }
 
+// Tamanho do chunk para salvar múltiplos itens em uma única transação
+const kvChunkSize = 1000
+
 func (kv *badgerStorage) loadRow(r []string, s sourceType, l *lookups) error {
 	i, err := newKVItem(s, l, r)
 	if err != nil {
@@ -101,10 +104,23 @@ func (kv *badgerStorage) loadRow(r []string, s sourceType, l *lookups) error {
 	return nil
 }
 
+// loadChunk salva múltiplos itens em uma única transação para melhor performance
+func (kv *badgerStorage) loadChunk(items []item) error {
+	return kv.db.Update(func(tx *badger.Txn) error {
+		for _, i := range items {
+			if err := tx.Set(i.key, i.value); err != nil {
+				return fmt.Errorf("could not set key-value in chunk: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 func (kv *badgerStorage) loadSource(ctx context.Context, s *source, l *lookups, bar *progressbar.ProgressBar, m int) error {
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(m)
-	ch := make(chan []string)
+	// Buffer canal para evitar bloqueios e acúmulo de memória
+	// Buffer de 1000 linhas reduz bloqueios sem usar muita memória
+	ch := make(chan []string, 1000)
 	g.Go(func() error {
 		defer close(ch)
 		err := s.sendTo(ctx, ch)
@@ -113,25 +129,91 @@ func (kv *badgerStorage) loadSource(ctx context.Context, s *source, l *lookups, 
 		}
 		return err
 	})
+	
+	// Canal para processar chunks - buffer suficiente para múltiplos chunks
+	chunkCh := make(chan []item, m*2)
+	
+	// Múltiplos workers para processar chunks em paralelo
+	// Limitar número de workers para evitar sobrecarga
+	numWorkers := m
+	if numWorkers > 8 {
+		numWorkers = 8 // Máximo de 8 workers para chunks
+	}
+	
+	// Workers para processar chunks
+	for w := 0; w < numWorkers; w++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case chunk, ok := <-chunkCh:
+					if !ok {
+						return nil
+					}
+					if err := kv.loadChunk(chunk); err != nil {
+						return fmt.Errorf("error loading chunk: %w", err)
+					}
+					// Atualizar progresso para todos os itens do chunk
+					if err := bar.Add(len(chunk)); err != nil {
+						return err
+					}
+				}
+			}
+		})
+	}
+	
+	// Acumular linhas em chunks
 	g.Go(func() error {
+		defer close(chunkCh)
+		chunk := make([]item, 0, kvChunkSize)
+		
 		for {
 			select {
 			case <-ctx.Done():
+				// Salvar chunk pendente antes de sair
+				if len(chunk) > 0 {
+					select {
+					case chunkCh <- chunk:
+					case <-ctx.Done():
+						return nil
+					}
+				}
 				return nil
 			case r, ok := <-ch:
 				if !ok {
+					// Canal fechado, salvar chunk pendente
+					if len(chunk) > 0 {
+						select {
+						case chunkCh <- chunk:
+						case <-ctx.Done():
+							return nil
+						}
+					}
 					return nil
 				}
-				g.Go(func() error {
-					if err := kv.loadRow(r, s.kind, l); err != nil {
-						return err
+				
+				// Criar item
+				i, err := newKVItem(s.kind, l, r)
+				if err != nil {
+					return fmt.Errorf("error creating item: %w", err)
+				}
+				
+				chunk = append(chunk, i)
+				
+				// Quando chunk atingir o tamanho, enviar para processamento
+				if len(chunk) >= kvChunkSize {
+					select {
+					case chunkCh <- chunk:
+						chunk = make([]item, 0, kvChunkSize) // Novo chunk vazio
+					case <-ctx.Done():
+						return nil
 					}
-					return bar.Add(1)
-				})
+				}
 			}
-
 		}
 	})
+	
 	return g.Wait()
 }
 
@@ -148,11 +230,14 @@ func (kv *badgerStorage) load(dir string, l *lookups, m int) error {
 	if err != nil {
 		return fmt.Errorf("could not load sources: %w", err)
 	}
-	tic := time.NewTicker(3 * time.Minute)
+	// GC mais frequente para reduzir uso de memória (a cada 1 minuto)
+	tic := time.NewTicker(1 * time.Minute)
 	defer tic.Stop()
 	go func() {
 		for range tic.C {
 			kv.garbageCollect()
+			// Forçar garbage collection do Go runtime também
+			runtime.GC()
 		}
 	}()
 	bar := progressbar.Default(t, "Processing base CNPJ, partners and taxes")
@@ -165,6 +250,7 @@ func (kv *badgerStorage) load(dir string, l *lookups, m int) error {
 	defer cancel()
 	g, ctx := errgroup.WithContext(ctx)
 	for _, src := range srcs {
+		src := src // Capturar variável para closure
 		g.Go(func() error {
 			return kv.loadSource(ctx, src, l, bar, m)
 		})
@@ -258,6 +344,10 @@ func newBadgerStorage(dir string, ro bool) (*badgerStorage, error) {
 	opt = opt.WithNumLevelZeroTables(1)     // Reduce from default 5 to 1
 	opt = opt.WithNumLevelZeroTablesStall(2) // Reduce from default 10 to 2
 	opt = opt.WithValueLogMaxEntries(100000) // Limit value log entries
+	// Reduzir tamanho do value log para economizar memória e disco
+	opt = opt.WithValueLogFileSize(64 << 20) // 64MB (padrão é 1GB)
+	// Reduzir tamanho das memtables
+	opt = opt.WithMemTableSize(16 << 20) // 16MB (padrão é 64MB)
 	slog.Debug("Creating temporary key-value storage", "path", dir)
 	if os.Getenv("DEBUG") == "" {
 		opt = opt.WithLogger(&noLogger{})

@@ -357,3 +357,13 @@ func (m *MongoDB) CreateExtraIndexes(idxs []string) error {
 	slog.Info(fmt.Sprintf("%d %s successfully created in the collection %s", len(r), l, companyTableName))
 	return nil
 }
+
+// ImportPartnersOnly is not supported for MongoDB (relational structure required)
+func (m *MongoDB) ImportPartnersOnly(partners []transform.PartnerData, cnpj string) error {
+	return fmt.Errorf("ImportPartnersOnly is not supported for MongoDB - use PostgreSQL for structured tables (socios_cnpj)")
+}
+
+// ImportPartnersBatch is not supported for MongoDB (relational structure required)
+func (m *MongoDB) ImportPartnersBatch(batch map[string][]transform.PartnerData) error {
+	return fmt.Errorf("ImportPartnersBatch is not supported for MongoDB - use PostgreSQL for structured tables (socios_cnpj)")
+}

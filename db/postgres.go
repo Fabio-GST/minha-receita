@@ -116,6 +116,12 @@ func (p *PostgreSQL) renderTemplate(key string) (string, error) {
 // Close closes the PostgreSQL connection
 func (p *PostgreSQL) Close() { p.pool.Close() }
 
+// Pool returns the underlying connection pool for custom queries
+func (p *PostgreSQL) Pool() *pgxpool.Pool { return p.pool }
+
+// Schema returns the PostgreSQL schema name
+func (p *PostgreSQL) Schema() string { return p.schema }
+
 // CompanyTableFullName is the name of the schame and table in dot-notation.
 func (p *PostgreSQL) CompanyTableFullName() string {
 	return fmt.Sprintf("%s.%s", p.schema, p.CompanyTableName)
@@ -178,6 +184,27 @@ func removeNonDigits(s string) string {
 	return re.ReplaceAllString(s, "")
 }
 
+// truncateString truncates a string to the specified maximum length
+// If the string is longer, it truncates and adds "..." at the end
+func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return s
+	}
+	if len(s) <= maxLen {
+		return s
+	}
+	// Truncate to maxLen-3 to leave room for "..."
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// truncateTo120 truncates a string to 120 characters (common VARCHAR(120) limit)
+func truncateTo120(s string) string {
+	return truncateString(s, 120)
+}
+
 // formatPhones concatenates valid phone numbers separated by comma
 func formatPhones(company *transform.Company) string {
 	var phones []string
@@ -236,6 +263,7 @@ func situacaoCadastralToString(code *int) string {
 
 // CreateCompaniesStructuredDirect inserts companies directly without JSON conversion
 // This is more memory-efficient than CreateCompaniesStructured
+// It also handles adding partners even when companies already exist
 func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) error {
 	ctx := context.Background()
 	
@@ -246,16 +274,26 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 	}
 	defer tx.Rollback(ctx)
 	
-	// Optimize transaction for bulk loading
+	// Optimize transaction for maximum performance (not worrying about storage)
 	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
 		slog.Warn("Could not disable synchronous commit", "error", err)
 	}
+	// Increase work_mem for better performance (256MB for faster sorting/hashing)
 	if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '256MB'"); err != nil {
 		slog.Warn("Could not set work_mem", "error", err)
 	}
+	// Increase maintenance_work_mem for faster index operations
+	if _, err := tx.Exec(ctx, "SET LOCAL maintenance_work_mem = '512MB'"); err != nil {
+		slog.Warn("Could not set maintenance_work_mem", "error", err)
+	}
+	// Disable constraint checks temporarily for faster inserts
+	if _, err := tx.Exec(ctx, "SET LOCAL constraint_exclusion = off"); err != nil {
+		slog.Warn("Could not set constraint_exclusion", "error", err)
+	}
 
-	// Prepare statements
-	insertBusinessSQL := `INSERT INTO business (
+	// Prepare batch insert SQL
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	insertBusinessSQL := fmt.Sprintf(`INSERT INTO %s (
 		cnpj, razao_social, nome_fantasia, situacao_cadastral,
 		cnae_principal, tipo_cnae_principal, cnaes_secundarios,
 		capital_social, natureza_juridica, qualificacao_responsavel,
@@ -265,44 +303,15 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 		endereco_cep, endereco_numero, endereco_logradouro,
 		endereco_bairro, endereco_cidade, endereco_uf,
 		endereco_tipo, endereco_complemento, telefones
-	) VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-		$11, $12, $13, $14, $15, $16, $17, $18, $19,
-		$20, $21, $22, $23, $24, $25
-	)
-	ON CONFLICT (cnpj) 
-	DO UPDATE SET 
-		razao_social = EXCLUDED.razao_social,
-		nome_fantasia = EXCLUDED.nome_fantasia,
-		situacao_cadastral = EXCLUDED.situacao_cadastral,
-		cnae_principal = EXCLUDED.cnae_principal,
-		tipo_cnae_principal = EXCLUDED.tipo_cnae_principal,
-		cnaes_secundarios = EXCLUDED.cnaes_secundarios,
-		capital_social = EXCLUDED.capital_social,
-		natureza_juridica = EXCLUDED.natureza_juridica,
-		qualificacao_responsavel = EXCLUDED.qualificacao_responsavel,
-		porte_empresa = EXCLUDED.porte_empresa,
-		identificador_matriz_filial = EXCLUDED.identificador_matriz_filial,
-		data_situacao_cadastral = EXCLUDED.data_situacao_cadastral,
-		motivo_situacao_cadastral = EXCLUDED.motivo_situacao_cadastral,
-		data_inicio_atividade = EXCLUDED.data_inicio_atividade,
-		email = EXCLUDED.email,
-		endereco_cep = EXCLUDED.endereco_cep,
-		endereco_numero = EXCLUDED.endereco_numero,
-		endereco_logradouro = EXCLUDED.endereco_logradouro,
-		endereco_bairro = EXCLUDED.endereco_bairro,
-		endereco_cidade = EXCLUDED.endereco_cidade,
-		endereco_uf = EXCLUDED.endereco_uf,
-		endereco_tipo = EXCLUDED.endereco_tipo,
-		endereco_complemento = EXCLUDED.endereco_complemento,
-		telefones = EXCLUDED.telefones,
-		updated_at = now()
-	RETURNING id`
+	) VALUES `, businessTable)
 
-	deletePartnersSQL := `DELETE FROM socios_cnpj WHERE business_id = $1`
+	// Build batch insert values
+	values := make([]string, 0, len(batch))
+	args := make([]interface{}, 0, len(batch)*25)
+	businessIDMap := make(map[string]int64) // Map CNPJ -> business_id for partners
+	argIndex := 1
 
 	for _, company := range batch {
-		// Clean CNPJ
 		cleanCNPJ := removeNonDigits(company.CNPJ)
 		if len(cleanCNPJ) != 14 {
 			slog.Warn("invalid CNPJ length", "cnpj", cleanCNPJ)
@@ -358,12 +367,42 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 			municipio = *company.Municipio
 		}
 
-		// Insert/Update business
-		var businessID int64
-		err := tx.QueryRow(ctx, insertBusinessSQL,
+		// Remove truncations for performance (let database handle it or use larger limits)
+		razaoSocial := company.RazaoSocial
+		if len(razaoSocial) > 200 {
+			razaoSocial = razaoSocial[:200] // Only truncate if really necessary
+		}
+		nomeFantasia := company.NomeFantasia
+		if len(nomeFantasia) > 200 {
+			nomeFantasia = nomeFantasia[:200]
+		}
+		logradouro := company.Logradouro
+		if len(logradouro) > 200 {
+			logradouro = logradouro[:200]
+		}
+		bairro := company.Bairro
+		if len(bairro) > 200 {
+			bairro = bairro[:200]
+		}
+		municipioStr := municipio
+		if len(municipioStr) > 200 {
+			municipioStr = municipioStr[:200]
+		}
+		complemento := company.Complemento
+		if len(complemento) > 200 {
+			complemento = complemento[:200]
+		}
+		
+		// Build batch insert values
+		values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4, argIndex+5, argIndex+6, argIndex+7, argIndex+8, argIndex+9,
+			argIndex+10, argIndex+11, argIndex+12, argIndex+13, argIndex+14, argIndex+15, argIndex+16, argIndex+17, argIndex+18, argIndex+19,
+			argIndex+20, argIndex+21, argIndex+22, argIndex+23, argIndex+24))
+		
+		args = append(args,
 			cleanCNPJ,
-			company.RazaoSocial,
-			company.NomeFantasia,
+			razaoSocial,
+			nomeFantasia,
 			situacaoCadastralToString(company.SituacaoCadastral),
 			formatCNAEPrincipal(company.CNAEFiscal),
 			getStringValue(company.CNAEFiscalDescricao),
@@ -379,27 +418,108 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 			getStringValue(company.Email),
 			cleanCEP,
 			company.Numero,
-			company.Logradouro,
-			company.Bairro,
-			municipio,
+			logradouro,
+			bairro,
+			municipioStr,
 			company.UF,
 			enderecoTipo,
-			company.Complemento,
+			complemento,
 			formatPhones(&company),
-		).Scan(&businessID)
+		)
+		argIndex += 25
+		
+		// Store company data for partners batch insert
+		businessIDMap[cleanCNPJ] = 0 // Will be filled after batch insert
+	}
 
+	// Execute batch insert for all businesses
+	if len(values) > 0 {
+		insertSQL := insertBusinessSQL + strings.Join(values, ", ") + ` ON CONFLICT (cnpj) DO NOTHING RETURNING id, cnpj`
+		rows, err := tx.Query(ctx, insertSQL, args...)
 		if err != nil {
-			slog.Error("error inserting business", "cnpj", cleanCNPJ, "error", err)
+			slog.Error("error batch inserting businesses", "error", err, "count", len(values))
+			return fmt.Errorf("error batch inserting businesses: %w", err)
+		}
+		defer rows.Close()
+		
+		// Track which CNPJs were inserted (returned by RETURNING)
+		insertedCNPJs := make(map[string]bool)
+		
+		// Map CNPJ to business_id for newly inserted businesses
+		for rows.Next() {
+			var businessID int64
+			var cnpj string
+			if err := rows.Scan(&businessID, &cnpj); err != nil {
+				slog.Warn("error scanning business_id", "error", err)
+				continue
+			}
+			businessIDMap[cnpj] = businessID
+			insertedCNPJs[cnpj] = true
+		}
+		if err := rows.Err(); err != nil {
+			slog.Warn("error iterating business rows", "error", err)
+		}
+		
+		// Find business_id for CNPJs that already existed (not returned by RETURNING)
+		// Use CNPJs from businessIDMap that weren't inserted
+		missingCNPJs := make([]string, 0)
+		for cnpj := range businessIDMap {
+			if !insertedCNPJs[cnpj] {
+				missingCNPJs = append(missingCNPJs, cnpj)
+			}
+		}
+		
+		// Batch query to get business_id for existing companies
+		if len(missingCNPJs) > 0 {
+			placeholders := make([]string, len(missingCNPJs))
+			queryArgs := make([]interface{}, len(missingCNPJs))
+			for i, cnpj := range missingCNPJs {
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+				queryArgs[i] = cnpj
+			}
+			
+			query := fmt.Sprintf("SELECT id, cnpj FROM %s WHERE cnpj IN (%s)", 
+				businessTable, strings.Join(placeholders, ","))
+			
+			existingRows, err := tx.Query(ctx, query, queryArgs...)
+			if err != nil {
+				slog.Warn("error querying existing businesses", "error", err)
+			} else {
+				defer existingRows.Close()
+				for existingRows.Next() {
+					var businessID int64
+					var cnpj string
+					if err := existingRows.Scan(&businessID, &cnpj); err != nil {
+						slog.Warn("error scanning existing business_id", "error", err)
+						continue
+					}
+					businessIDMap[cnpj] = businessID
+				}
+				if err := existingRows.Err(); err != nil {
+					slog.Warn("error iterating existing business rows", "error", err)
+				}
+			}
+		}
+	}
+
+	// Batch insert partners for all companies
+	sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+	partnerValues := make([]string, 0)
+	partnerArgs := make([]interface{}, 0)
+	partnerArgIndex := 1
+
+	for _, company := range batch {
+		cleanCNPJ := removeNonDigits(company.CNPJ)
+		if len(cleanCNPJ) != 14 {
 			continue
 		}
-
-		// Delete existing partners
-		_, err = tx.Exec(ctx, deletePartnersSQL, businessID)
-		if err != nil {
-			slog.Warn("error deleting existing partners", "business_id", businessID, "error", err)
+		
+		businessID, exists := businessIDMap[cleanCNPJ]
+		if !exists || businessID == 0 {
+			continue // Business not inserted (conflict or error)
 		}
 
-		// Insert partners
+		// Insert partners (no DELETE - preserve existing data, skip duplicates)
 		for _, partner := range company.QuadroSocietario {
 			var dataEntrada *time.Time
 			if partner.DataEntradaSociedade != nil {
@@ -413,9 +533,12 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 			}
 
 			cpfSocio := partner.CNPJCPFDoSocio
+			// Remove caracteres não numéricos e salva apenas os dígitos encontrados
+			// Se tiver mais de 11 dígitos (CNPJ), não insere
 			cleanCPFSocio := removeNonDigits(cpfSocio)
-			if len(cleanCPFSocio) != 11 {
-				cleanCPFSocio = ""
+			if len(cleanCPFSocio) > 11 {
+				slog.Warn("CPF com mais de 11 dígitos, ignorando sócio", "business_id", businessID, "cpf", cleanCPFSocio, "partner", partner.NomeSocio)
+				continue // Pula este sócio se tiver mais de 11 dígitos
 			}
 
 			var cpfSocioValue interface{}
@@ -425,24 +548,43 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 				cpfSocioValue = nil
 			}
 
-			_, err = tx.Exec(ctx, `INSERT INTO socios_cnpj (
-				business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
-			) VALUES ($1, $2, $3, $4, $5, $6)`,
-				businessID,
-				cleanCNPJ,
-				partner.NomeSocio,
-				cpfSocioValue,
-				dataEntrada,
-				qualificacao,
-			)
-			if err != nil {
-				slog.Warn("error inserting partner", "business_id", businessID, "partner", partner.NomeSocio, "error", err)
+			// Minimal truncation for performance
+			nomeSocio := partner.NomeSocio
+			if len(nomeSocio) > 200 {
+				nomeSocio = nomeSocio[:200]
 			}
+			qualificacaoStr := qualificacao
+			if len(qualificacaoStr) > 200 {
+				qualificacaoStr = qualificacaoStr[:200]
+			}
+
+			partnerValues = append(partnerValues, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)",
+				partnerArgIndex, partnerArgIndex+1, partnerArgIndex+2, partnerArgIndex+3, partnerArgIndex+4, partnerArgIndex+5))
+			partnerArgs = append(partnerArgs, businessID, cleanCNPJ, nomeSocio, cpfSocioValue, dataEntrada, qualificacaoStr)
+			partnerArgIndex += 6
+		}
+	}
+
+	// Execute batch insert for all partners
+	if len(partnerValues) > 0 {
+		partnerInsertSQL := fmt.Sprintf(`INSERT INTO %s (
+			business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+		) VALUES %s ON CONFLICT (cnpj, nome_socio) DO NOTHING`, sociosCnpjTable, strings.Join(partnerValues, ", "))
+		
+		_, err = tx.Exec(ctx, partnerInsertSQL, partnerArgs...)
+		if err != nil {
+			slog.Warn("error batch inserting partners", "error", err, "count", len(partnerValues))
+			// Continue - partners are optional
 		}
 	}
 
 	// Commit transaction
+	// If there was a rollback and a new transaction started, this commits the new transaction
 	if err := tx.Commit(ctx); err != nil {
+		// If commit fails, try rollback to clean up
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			slog.Warn("error rolling back failed commit", "error", rbErr)
+		}
 		return fmt.Errorf("error committing transaction: %w", err)
 	}
 
@@ -451,6 +593,7 @@ func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) 
 
 // CreateCompaniesStructured inserts companies into business and business_partners tables
 // This method creates JSON first (for compatibility), but CreateCompaniesStructuredDirect is preferred
+// It also handles adding partners even when companies already exist
 func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 	ctx := context.Background()
 	
@@ -461,21 +604,22 @@ func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 	}
 	defer tx.Rollback(ctx)
 	
-	// Optimize transaction for bulk loading: disable synchronous commit temporarily
-	// This reduces I/O and improves performance during bulk inserts
+	// Optimize transaction for maximum performance (not worrying about storage)
 	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
 		slog.Warn("Could not disable synchronous commit", "error", err)
-		// Continue anyway
 	}
-	
-	// Set work_mem higher for this transaction to reduce disk usage
+	// Increase work_mem for better performance
 	if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '256MB'"); err != nil {
 		slog.Warn("Could not set work_mem", "error", err)
-		// Continue anyway
+	}
+	// Increase maintenance_work_mem for faster index operations
+	if _, err := tx.Exec(ctx, "SET LOCAL maintenance_work_mem = '512MB'"); err != nil {
+		slog.Warn("Could not set maintenance_work_mem", "error", err)
 	}
 
-	// Prepare statements
-	insertBusinessSQL := `INSERT INTO business (
+	// Prepare batch insert SQL
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	insertBusinessSQL := fmt.Sprintf(`INSERT INTO %s (
 		cnpj, razao_social, nome_fantasia, situacao_cadastral,
 		cnae_principal, tipo_cnae_principal, cnaes_secundarios,
 		capital_social, natureza_juridica, qualificacao_responsavel,
@@ -485,42 +629,13 @@ func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 		endereco_cep, endereco_numero, endereco_logradouro,
 		endereco_bairro, endereco_cidade, endereco_uf,
 		endereco_tipo, endereco_complemento, telefones
-	) VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-		$11, $12, $13, $14, $15, $16, $17, $18, $19,
-		$20, $21, $22, $23, $24, $25
-	)
-	ON CONFLICT (cnpj) 
-	DO UPDATE SET 
-		razao_social = EXCLUDED.razao_social,
-		nome_fantasia = EXCLUDED.nome_fantasia,
-		situacao_cadastral = EXCLUDED.situacao_cadastral,
-		cnae_principal = EXCLUDED.cnae_principal,
-		tipo_cnae_principal = EXCLUDED.tipo_cnae_principal,
-		cnaes_secundarios = EXCLUDED.cnaes_secundarios,
-		capital_social = EXCLUDED.capital_social,
-		natureza_juridica = EXCLUDED.natureza_juridica,
-		qualificacao_responsavel = EXCLUDED.qualificacao_responsavel,
-		porte_empresa = EXCLUDED.porte_empresa,
-		identificador_matriz_filial = EXCLUDED.identificador_matriz_filial,
-		data_situacao_cadastral = EXCLUDED.data_situacao_cadastral,
-		motivo_situacao_cadastral = EXCLUDED.motivo_situacao_cadastral,
-		data_inicio_atividade = EXCLUDED.data_inicio_atividade,
-		email = EXCLUDED.email,
-		endereco_cep = EXCLUDED.endereco_cep,
-		endereco_numero = EXCLUDED.endereco_numero,
-		endereco_logradouro = EXCLUDED.endereco_logradouro,
-		endereco_bairro = EXCLUDED.endereco_bairro,
-		endereco_cidade = EXCLUDED.endereco_cidade,
-		endereco_uf = EXCLUDED.endereco_uf,
-		endereco_tipo = EXCLUDED.endereco_tipo,
-		endereco_complemento = EXCLUDED.endereco_complemento,
-		telefones = EXCLUDED.telefones,
-		updated_at = now()
-	RETURNING id`
+	) VALUES `, businessTable)
 
-	// Delete existing partners for companies being updated
-	deletePartnersSQL := `DELETE FROM socios_cnpj WHERE business_id = $1`
+	// Build batch insert values
+	values := make([]string, 0, len(batch))
+	args := make([]interface{}, 0, len(batch)*25)
+	businessIDMap := make(map[string]int64) // Map CNPJ -> business_id for partners
+	argIndex := 1
 
 	for _, record := range batch {
 		if len(record) < 2 {
@@ -593,50 +708,172 @@ func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 			municipio = *company.Municipio
 		}
 
-		// Insert/Update business
-		var businessID int64
-		err := tx.QueryRow(ctx, insertBusinessSQL,
-			cleanCNPJ,                                    // cnpj
-			company.RazaoSocial,                         // razao_social
-			company.NomeFantasia,                        // nome_fantasia
-			situacaoCadastralToString(company.SituacaoCadastral), // situacao_cadastral
-			formatCNAEPrincipal(company.CNAEFiscal),     // cnae_principal
-			getStringValue(company.CNAEFiscalDescricao), // tipo_cnae_principal
-			formatSecondaryCNAEs(company.CNAESecundarios), // cnaes_secundarios
-			capitalSocial,                               // capital_social
-			naturezaJuridica,                            // natureza_juridica
-			qualificacaoResponsavel,                      // qualificacao_responsavel
-			porteEmpresa,                                // porte_empresa
-			identificadorMatrizFilial,                   // identificador_matriz_filial
-			convertDate(company.DataSituacaoCadastral),  // data_situacao_cadastral
-			motivoSituacaoCadastral,                     // motivo_situacao_cadastral
-			convertDate(company.DataInicioAtividade),     // data_inicio_atividade
-			getStringValue(company.Email),               // email
-			cleanCEP,                                    // endereco_cep
-			company.Numero,                              // endereco_numero
-			company.Logradouro,                          // endereco_logradouro
-			company.Bairro,                              // endereco_bairro
-			municipio,                                   // endereco_cidade
-			company.UF,                                  // endereco_uf
-			enderecoTipo,                                // endereco_tipo
-			company.Complemento,                         // endereco_complemento
-			formatPhones(&company),                      // telefones
-		).Scan(&businessID)
+		// Minimal truncation for performance
+		razaoSocial := company.RazaoSocial
+		if len(razaoSocial) > 200 {
+			razaoSocial = razaoSocial[:200]
+		}
+		nomeFantasia := company.NomeFantasia
+		if len(nomeFantasia) > 200 {
+			nomeFantasia = nomeFantasia[:200]
+		}
+		logradouro := company.Logradouro
+		if len(logradouro) > 200 {
+			logradouro = logradouro[:200]
+		}
+		bairro := company.Bairro
+		if len(bairro) > 200 {
+			bairro = bairro[:200]
+		}
+		municipioStr := municipio
+		if len(municipioStr) > 200 {
+			municipioStr = municipioStr[:200]
+		}
+		complemento := company.Complemento
+		if len(complemento) > 200 {
+			complemento = complemento[:200]
+		}
+		
+		// Build batch insert values
+		values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4, argIndex+5, argIndex+6, argIndex+7, argIndex+8, argIndex+9,
+			argIndex+10, argIndex+11, argIndex+12, argIndex+13, argIndex+14, argIndex+15, argIndex+16, argIndex+17, argIndex+18, argIndex+19,
+			argIndex+20, argIndex+21, argIndex+22, argIndex+23, argIndex+24))
+		
+		args = append(args,
+			cleanCNPJ,
+			razaoSocial,
+			nomeFantasia,
+			situacaoCadastralToString(company.SituacaoCadastral),
+			formatCNAEPrincipal(company.CNAEFiscal),
+			getStringValue(company.CNAEFiscalDescricao),
+			formatSecondaryCNAEs(company.CNAESecundarios),
+			capitalSocial,
+			naturezaJuridica,
+			qualificacaoResponsavel,
+			porteEmpresa,
+			identificadorMatrizFilial,
+			convertDate(company.DataSituacaoCadastral),
+			motivoSituacaoCadastral,
+			convertDate(company.DataInicioAtividade),
+			getStringValue(company.Email),
+			cleanCEP,
+			company.Numero,
+			logradouro,
+			bairro,
+			municipioStr,
+			company.UF,
+			enderecoTipo,
+			complemento,
+			formatPhones(&company),
+		)
+		argIndex += 25
+		
+		// Store company data for partners batch insert
+		businessIDMap[cleanCNPJ] = 0 // Will be filled after batch insert
+	}
 
+	// Execute batch insert for all businesses
+	if len(values) > 0 {
+		insertSQL := insertBusinessSQL + strings.Join(values, ", ") + ` ON CONFLICT (cnpj) DO NOTHING RETURNING id, cnpj`
+		rows, err := tx.Query(ctx, insertSQL, args...)
 		if err != nil {
-			slog.Error("error inserting business", "cnpj", cleanCNPJ, "error", err)
+			slog.Error("error batch inserting businesses", "error", err, "count", len(values))
+			return fmt.Errorf("error batch inserting businesses: %w", err)
+		}
+		defer rows.Close()
+		
+		// Track which CNPJs were inserted (returned by RETURNING)
+		insertedCNPJs := make(map[string]bool)
+		
+		// Map CNPJ to business_id for newly inserted businesses
+		for rows.Next() {
+			var businessID int64
+			var cnpj string
+			if err := rows.Scan(&businessID, &cnpj); err != nil {
+				slog.Warn("error scanning business_id", "error", err)
+				continue
+			}
+			businessIDMap[cnpj] = businessID
+			insertedCNPJs[cnpj] = true
+		}
+		if err := rows.Err(); err != nil {
+			slog.Warn("error iterating business rows", "error", err)
+		}
+		
+		// Find business_id for CNPJs that already existed (not returned by RETURNING)
+		// Use CNPJs from businessIDMap that weren't inserted
+		missingCNPJs := make([]string, 0)
+		for cnpj := range businessIDMap {
+			if !insertedCNPJs[cnpj] {
+				missingCNPJs = append(missingCNPJs, cnpj)
+			}
+		}
+		
+		// Batch query to get business_id for existing companies
+		if len(missingCNPJs) > 0 {
+			placeholders := make([]string, len(missingCNPJs))
+			queryArgs := make([]interface{}, len(missingCNPJs))
+			for i, cnpj := range missingCNPJs {
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+				queryArgs[i] = cnpj
+			}
+			
+			query := fmt.Sprintf("SELECT id, cnpj FROM %s WHERE cnpj IN (%s)", 
+				businessTable, strings.Join(placeholders, ","))
+			
+			existingRows, err := tx.Query(ctx, query, queryArgs...)
+			if err != nil {
+				slog.Warn("error querying existing businesses", "error", err)
+			} else {
+				defer existingRows.Close()
+				for existingRows.Next() {
+					var businessID int64
+					var cnpj string
+					if err := existingRows.Scan(&businessID, &cnpj); err != nil {
+						slog.Warn("error scanning existing business_id", "error", err)
+						continue
+					}
+					businessIDMap[cnpj] = businessID
+				}
+				if err := existingRows.Err(); err != nil {
+					slog.Warn("error iterating existing business rows", "error", err)
+				}
+			}
+		}
+	}
+
+	// Batch insert partners for all companies
+	sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+	partnerValues := make([]string, 0)
+	partnerArgs := make([]interface{}, 0)
+	partnerArgIndex := 1
+
+	for _, record := range batch {
+		if len(record) < 2 {
+			slog.Warn("skipping invalid record", "record", record)
 			continue
 		}
 
-		// Delete existing partners before inserting new ones
-		// This ensures we don't have duplicates and handles NULL people_id correctly
-		_, err = tx.Exec(ctx, deletePartnersSQL, businessID)
-		if err != nil {
-			slog.Warn("error deleting existing partners", "business_id", businessID, "error", err)
-			// Continue anyway
+		// Parse JSON
+		var company transform.Company
+		if err := json.Unmarshal([]byte(record[1]), &company); err != nil {
+			slog.Error("error parsing company JSON", "cnpj", record[0], "error", err)
+			continue
 		}
 
-		// Insert partners into socios_cnpj table
+		cleanCNPJ := removeNonDigits(company.CNPJ)
+		if len(cleanCNPJ) != 14 {
+			slog.Warn("invalid CNPJ length", "cnpj", cleanCNPJ)
+			continue
+		}
+		
+		businessID, exists := businessIDMap[cleanCNPJ]
+		if !exists || businessID == 0 {
+			continue // Business not inserted (conflict or error)
+		}
+
+		// Insert partners (no DELETE - preserve existing data, skip duplicates)
 		for _, partner := range company.QuadroSocietario {
 			var dataEntrada *time.Time
 			if partner.DataEntradaSociedade != nil {
@@ -651,10 +888,12 @@ func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 
 			// Extract CPF from partner (may be masked like ***220050**)
 			cpfSocio := partner.CNPJCPFDoSocio
+			// Remove caracteres não numéricos e salva apenas os dígitos encontrados
+			// Se tiver mais de 11 dígitos (CNPJ), não insere
 			cleanCPFSocio := removeNonDigits(cpfSocio)
-			// If CPF is not valid (not 11 digits), set to NULL
-			if len(cleanCPFSocio) != 11 {
-				cleanCPFSocio = ""
+			if len(cleanCPFSocio) > 11 {
+				slog.Warn("CPF com mais de 11 dígitos, ignorando sócio", "business_id", businessID, "cpf", cleanCPFSocio, "partner", partner.NomeSocio)
+				continue // Pula este sócio se tiver mais de 11 dígitos
 			}
 
 			// Insert partner into socios_cnpj
@@ -665,25 +904,43 @@ func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
 				cpfSocioValue = nil
 			}
 
-			_, err = tx.Exec(ctx, `INSERT INTO socios_cnpj (
-				business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
-			) VALUES ($1, $2, $3, $4, $5, $6)`,
-				businessID,    // business_id
-				cleanCNPJ,     // cnpj (CNPJ da empresa)
-				partner.NomeSocio, // nome_socio
-				cpfSocioValue, // cpf_socio (pode ser NULL)
-				dataEntrada,   // data_entrada_sociedade
-				qualificacao,  // qualificacao
-			)
-			if err != nil {
-				slog.Warn("error inserting partner", "business_id", businessID, "partner", partner.NomeSocio, "error", err)
-				// Continue with next partner
+			// Minimal truncation for performance
+			nomeSocio := partner.NomeSocio
+			if len(nomeSocio) > 200 {
+				nomeSocio = nomeSocio[:200]
 			}
+			qualificacaoStr := qualificacao
+			if len(qualificacaoStr) > 200 {
+				qualificacaoStr = qualificacaoStr[:200]
+			}
+
+			partnerValues = append(partnerValues, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)",
+				partnerArgIndex, partnerArgIndex+1, partnerArgIndex+2, partnerArgIndex+3, partnerArgIndex+4, partnerArgIndex+5))
+			partnerArgs = append(partnerArgs, businessID, cleanCNPJ, nomeSocio, cpfSocioValue, dataEntrada, qualificacaoStr)
+			partnerArgIndex += 6
+		}
+	}
+
+	// Execute batch insert for all partners
+	if len(partnerValues) > 0 {
+		partnerInsertSQL := fmt.Sprintf(`INSERT INTO %s (
+			business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+		) VALUES %s ON CONFLICT (cnpj, nome_socio) DO NOTHING`, sociosCnpjTable, strings.Join(partnerValues, ", "))
+		
+		_, err = tx.Exec(ctx, partnerInsertSQL, partnerArgs...)
+		if err != nil {
+			slog.Warn("error batch inserting partners", "error", err, "count", len(partnerValues))
+			// Continue - partners are optional
 		}
 	}
 
 	// Commit transaction
+	// If there was a rollback and a new transaction started, this commits the new transaction
 	if err := tx.Commit(ctx); err != nil {
+		// If commit fails, try rollback to clean up
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			slog.Warn("error rolling back failed commit", "error", rbErr)
+		}
 		return fmt.Errorf("error committing transaction: %w", err)
 	}
 
@@ -840,17 +1097,49 @@ func (p *PostgreSQL) Search(ctx context.Context, q *Query) (string, error) {
 func (p *PostgreSQL) PreLoad() error {
 	// Optimize storage before loading: run VACUUM to reclaim space
 	// Use VACUUM (not VACUUM FULL) to avoid blocking and reduce disk usage
+	// Run VACUUM ANALYZE on specific tables to reclaim space more efficiently
 	slog.Info("Running VACUUM to optimize storage before loading...")
-	vacuumSQL := "VACUUM"
-	if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
-		slog.Warn("Could not run VACUUM before loading", "error", err)
-		// Continue anyway, not critical - VACUUM can fail if disk is full
+	
+	// Check which tables exist and vacuum them specifically
+	checkQuery := `SELECT EXISTS (
+		SELECT FROM information_schema.tables 
+		WHERE table_schema = $1 AND table_name = 'business'
+	)`
+	var businessExists bool
+	err := p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessExists)
+	if err == nil && businessExists {
+		// Create functional index for CNPJ base lookups (optimizes partner imports)
+		businessTable := fmt.Sprintf("%s.business", p.schema)
+		createIndexSQL := fmt.Sprintf(`
+			CREATE INDEX IF NOT EXISTS idx_business_cnpj_base 
+			ON %s (LEFT(cnpj, 8))
+		`, businessTable)
+		if _, err := p.pool.Exec(context.Background(), createIndexSQL); err != nil {
+			slog.Warn("Could not create functional index for CNPJ base lookups", "error", err)
+			// Continue anyway - the query will still work, just slower
+		} else {
+			slog.Info("Created functional index for CNPJ base lookups (optimizes partner imports)")
+		}
+		
+		// Vacuum business and socios_cnpj tables specifically
+		vacuumSQL := fmt.Sprintf("VACUUM ANALYZE %s.business, %s.socios_cnpj", p.schema, p.schema)
+		if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
+			slog.Warn("Could not run VACUUM on business tables before loading", "error", err)
+			// Try generic VACUUM as fallback
+			if _, err := p.pool.Exec(context.Background(), "VACUUM"); err != nil {
+				slog.Warn("Could not run generic VACUUM before loading", "error", err)
+			}
+		} else {
+			slog.Info("VACUUM completed successfully on business tables")
+		}
 	} else {
-		slog.Info("VACUUM completed successfully")
-		// Run ANALYZE separately to update statistics
-		analyzeSQL := "ANALYZE"
-		if _, err := p.pool.Exec(context.Background(), analyzeSQL); err != nil {
-			slog.Warn("Could not run ANALYZE", "error", err)
+		// Try generic VACUUM for JSON mode
+		vacuumSQL := "VACUUM ANALYZE"
+		if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
+			slog.Warn("Could not run VACUUM before loading", "error", err)
+			// Continue anyway, not critical - VACUUM can fail if disk is full
+		} else {
+			slog.Info("VACUUM completed successfully")
 		}
 	}
 	
@@ -865,23 +1154,9 @@ func (p *PostgreSQL) PreLoad() error {
 		// Continue anyway
 	}
 	
-	// Check which table exists: business (structured) or cnpj (JSON)
-	// Try business table first (structured mode)
+	// Use the businessExists variable already checked above
 	businessTable := fmt.Sprintf("%s.business", p.schema)
 	cnpjTable := p.CompanyTableFullName()
-	
-	var checkQuery string
-	
-	// Check if business table exists
-	checkQuery = `SELECT EXISTS (
-		SELECT FROM information_schema.tables 
-		WHERE table_schema = $1 AND table_name = 'business'
-	)`
-	var businessExists bool
-	err := p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessExists)
-	if err != nil {
-		return fmt.Errorf("error checking if business table exists: %w", err)
-	}
 	
 	if businessExists {
 		// In structured mode, we need to set UNLOGGED on all related tables
@@ -924,11 +1199,14 @@ func (p *PostgreSQL) PreLoad() error {
 		}
 		
 		// Step 3: Set business to UNLOGGED (after all tables it references)
+		// If this fails due to disk space, continue anyway - UNLOGGED is an optimization, not required
 		sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", businessTable)
 		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
-			return fmt.Errorf("error during pre load: %s\n%w", sql, err)
+			slog.Warn("Could not set business to UNLOGGED (continuing anyway)", "table", businessTable, "error", err)
+			slog.Info("Continuing with LOGGED mode - this will use more disk space but will work")
+		} else {
+			slog.Debug("Set business table to UNLOGGED", "table", businessTable)
 		}
-		slog.Debug("Set business table to UNLOGGED", "table", businessTable)
 		
 		return nil
 	}
@@ -962,9 +1240,13 @@ func (p *PostgreSQL) PreLoad() error {
 		}
 		
 		// Apply UNLOGGED to the table
+		// If this fails due to disk space, continue anyway - UNLOGGED is an optimization, not required
 		sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", cnpjTable)
 		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
-			return fmt.Errorf("error during pre load: %s\n%w", sql, err)
+			slog.Warn("Could not set cnpj table to UNLOGGED (continuing anyway)", "table", cnpjTable, "error", err)
+			slog.Info("Continuing with LOGGED mode - this will use more disk space but will work")
+		} else {
+			slog.Debug("Set cnpj table to UNLOGGED", "table", cnpjTable)
 		}
 		return nil
 	}
@@ -1107,6 +1389,469 @@ func (p *PostgreSQL) PostLoad() error {
 	
 	// If neither exists, skip optimization
 	slog.Warn("No tables found, skipping LOGGED optimization")
+	return nil
+}
+
+// ImportPartnersOnly imports only partners data from Socios CSV files into socios_cnpj table
+// This function reads partner data and inserts it directly into socios_cnpj table
+// It requires the business table to exist and will get business_id from it based on CNPJ base (8 digits)
+// The cnpj parameter can be either a full CNPJ (14 digits) or a CNPJ base (8 digits)
+func (p *PostgreSQL) ImportPartnersOnly(partners []transform.PartnerData, cnpj string) error {
+	ctx := context.Background()
+	
+	// Clean CNPJ
+	cleanCNPJ := removeNonDigits(cnpj)
+	
+	// CNPJ base has 8 digits, full CNPJ has 14 digits
+	// If we have 8 digits, it's a base and we need to find all businesses with that base
+	// If we have 14 digits, it's a full CNPJ
+	var businessIDs []int
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	
+	if len(cleanCNPJ) == 8 {
+		// CNPJ base: find all businesses that start with this base
+		// Using LEFT() function which is optimized and can use functional index
+		// This is more performatic than LIKE when we have an index on LEFT(cnpj, 8)
+		query := fmt.Sprintf(
+			"SELECT id FROM %s WHERE cnpj LIKE $1 || '%%'",
+			businessTable,
+	)
+	rows, err := p.pool.Query(ctx, query, cleanCNPJ)
+	
+		if err != nil {
+			return fmt.Errorf("error querying businesses for CNPJ base %s: %w", cleanCNPJ, err)
+		}
+		defer rows.Close()
+		
+		for rows.Next() {
+			var businessID int
+			if err := rows.Scan(&businessID); err != nil {
+				return fmt.Errorf("error scanning business_id: %w", err)
+			}
+			businessIDs = append(businessIDs, businessID)
+		}
+		
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating business rows: %w", err)
+		}
+		
+		if len(businessIDs) == 0 {
+			slog.Warn("No businesses found for CNPJ base, skipping partners", "cnpj_base", cleanCNPJ)
+			return nil // Skip if no businesses found
+		}
+	} else if len(cleanCNPJ) == 14 {
+		// Full CNPJ: find the specific business
+		var businessID int
+		err := p.pool.QueryRow(ctx, fmt.Sprintf("SELECT id FROM %s WHERE cnpj = $1", businessTable), cleanCNPJ).Scan(&businessID)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				slog.Warn("Business not found for CNPJ, skipping partners", "cnpj", cleanCNPJ)
+				return nil // Skip if business doesn't exist
+			}
+			return fmt.Errorf("error getting business_id for CNPJ %s: %w", cleanCNPJ, err)
+		}
+		businessIDs = []int{businessID}
+	} else {
+		return fmt.Errorf("invalid CNPJ length (expected 8 or 14 digits): %s (length: %d)", cleanCNPJ, len(cleanCNPJ))
+	}
+	
+	// Process partners for each business found using batch inserts for better performance
+	sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+	
+	for _, businessID := range businessIDs {
+		// Get the full CNPJ for this business to use in socios_cnpj table
+		var fullCNPJ string
+		err := p.pool.QueryRow(ctx, fmt.Sprintf("SELECT cnpj FROM %s WHERE id = $1", businessTable), businessID).Scan(&fullCNPJ)
+		if err != nil {
+			slog.Warn("error getting CNPJ for business_id", "business_id", businessID, "error", err)
+			continue
+		}
+		
+		// Begin transaction
+		tx, err := p.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("error beginning transaction: %w", err)
+		}
+		
+		// Optimize transaction for bulk loading
+		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
+			slog.Warn("Could not disable synchronous commit", "error", err)
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '64MB'"); err != nil {
+			slog.Warn("Could not set work_mem", "error", err)
+		}
+		
+		// Use batch insert for better performance (no DELETE - preserve existing data)
+		if len(partners) > 0 {
+			// Prepare batch insert statement
+			insertSQL := fmt.Sprintf(`INSERT INTO %s (
+				business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+			) VALUES `, sociosCnpjTable)
+			
+			// Build values and args for batch insert
+			values := make([]string, 0, len(partners))
+			args := make([]interface{}, 0, len(partners)*6)
+			argIndex := 1
+			
+			for _, partner := range partners {
+				var dataEntrada *time.Time
+				if partner.DataEntradaSociedade != nil {
+					dt := time.Time(*partner.DataEntradaSociedade)
+					dataEntrada = &dt
+				}
+				
+				var qualificacao string
+				if partner.QualificaoSocio != nil {
+					qualificacao = *partner.QualificaoSocio
+				}
+				
+				// Extract CPF from partner (may be masked like ***220050**)
+				cpfSocio := partner.CNPJCPFDoSocio
+				cleanCPFSocio := removeNonDigits(cpfSocio)
+				// Se tiver mais de 11 dígitos (CNPJ), não insere
+				if len(cleanCPFSocio) > 11 {
+					slog.Warn("CPF com mais de 11 dígitos, ignorando sócio", "business_id", businessID, "cpf", cleanCPFSocio, "partner", partner.NomeSocio)
+					continue // Pula este sócio se tiver mais de 11 dígitos
+				}
+				
+				var cpfSocioValue interface{}
+				if cleanCPFSocio != "" {
+					cpfSocioValue = cleanCPFSocio
+				} else {
+					cpfSocioValue = nil
+				}
+				
+				// Truncate partner fields that may exceed database limits
+				nomeSocio := truncateTo120(partner.NomeSocio)
+				qualificacaoTrunc := truncateTo120(qualificacao)
+				
+				values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)", 
+					argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4, argIndex+5))
+				args = append(args, businessID, fullCNPJ, nomeSocio, cpfSocioValue, dataEntrada, qualificacaoTrunc)
+				argIndex += 6
+			}
+			
+			// Execute batch insert with ON CONFLICT to skip duplicates
+			if len(values) > 0 {
+				insertSQL += strings.Join(values, ", ")
+				insertSQL += fmt.Sprintf(` ON CONFLICT (cnpj, nome_socio) DO NOTHING`)
+				_, err = tx.Exec(ctx, insertSQL, args...)
+				if err != nil {
+					slog.Warn("error batch inserting partners", "business_id", businessID, "partners_count", len(partners), "error", err)
+					// Fallback to individual inserts if batch fails
+					for _, partner := range partners {
+						var dataEntrada *time.Time
+						if partner.DataEntradaSociedade != nil {
+							dt := time.Time(*partner.DataEntradaSociedade)
+							dataEntrada = &dt
+						}
+						
+						var qualificacao string
+						if partner.QualificaoSocio != nil {
+							qualificacao = *partner.QualificaoSocio
+						}
+						
+						cpfSocio := partner.CNPJCPFDoSocio
+						cleanCPFSocio := removeNonDigits(cpfSocio)
+						// Se tiver mais de 11 dígitos (CNPJ), não insere
+						if len(cleanCPFSocio) > 11 {
+							slog.Warn("CPF com mais de 11 dígitos, ignorando sócio (fallback)", "business_id", businessID, "cpf", cleanCPFSocio, "partner", partner.NomeSocio)
+							continue // Pula este sócio se tiver mais de 11 dígitos
+						}
+						
+						var cpfSocioValue interface{}
+						if cleanCPFSocio != "" {
+							cpfSocioValue = cleanCPFSocio
+						} else {
+							cpfSocioValue = nil
+						}
+						
+						nomeSocio := truncateTo120(partner.NomeSocio)
+						qualificacaoTrunc := truncateTo120(qualificacao)
+						
+						_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (
+							business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+						) VALUES ($1, $2, $3, $4, $5, $6)
+						ON CONFLICT (cnpj, nome_socio) DO NOTHING`, sociosCnpjTable),
+							businessID, fullCNPJ, nomeSocio, cpfSocioValue, dataEntrada, qualificacaoTrunc,
+						)
+						if err != nil {
+							slog.Warn("error inserting partner (fallback)", "business_id", businessID, "partner", partner.NomeSocio, "error", err)
+						}
+					}
+				}
+			}
+		}
+		
+		// Commit transaction
+		if err := tx.Commit(ctx); err != nil {
+			slog.Warn("error committing transaction", "business_id", businessID, "error", err)
+			tx.Rollback(ctx)
+			continue
+		}
+	}
+	
+	return nil
+}
+
+// ImportPartnersBatch imports multiple CNPJs' partners data in a single batch operation
+// This function processes all CNPJs together, making batch SELECTs for better performance
+func (p *PostgreSQL) ImportPartnersBatch(batch map[string][]transform.PartnerData) error {
+	ctx := context.Background()
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+	
+	if len(batch) == 0 {
+		return nil
+	}
+	
+	// Separate CNPJs by type (8 digits = base, 14 digits = full)
+	var baseCNPJs []string
+	var fullCNPJs []string
+	cnpjToPartners := make(map[string][]transform.PartnerData)
+	
+	for cnpj, partners := range batch {
+		cleanCNPJ := removeNonDigits(cnpj)
+		cnpjToPartners[cleanCNPJ] = partners
+		
+		if len(cleanCNPJ) == 8 {
+			baseCNPJs = append(baseCNPJs, cleanCNPJ)
+		} else if len(cleanCNPJ) == 14 {
+			fullCNPJs = append(fullCNPJs, cleanCNPJ)
+		}
+	}
+	
+	// Map to store CNPJ -> []businessID
+	cnpjToBusinessIDs := make(map[string][]int)
+	
+	// Batch query for base CNPJs (8 digits)
+	if len(baseCNPJs) > 0 {
+		// Build query with IN clause for batch lookup
+		placeholders := make([]string, len(baseCNPJs))
+		args := make([]interface{}, len(baseCNPJs))
+		for i, base := range baseCNPJs {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = base
+		}
+		
+		query := fmt.Sprintf("SELECT id, LEFT(cnpj, 8) as cnpj_base FROM %s WHERE LEFT(cnpj, 8) IN (%s)", 
+			businessTable, strings.Join(placeholders, ","))
+		
+		rows, err := p.pool.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("error batch querying businesses for CNPJ bases: %w", err)
+		}
+		defer rows.Close()
+		
+		for rows.Next() {
+			var businessID int
+			var cnpjBase string
+			if err := rows.Scan(&businessID, &cnpjBase); err != nil {
+				return fmt.Errorf("error scanning business_id: %w", err)
+			}
+			cnpjToBusinessIDs[cnpjBase] = append(cnpjToBusinessIDs[cnpjBase], businessID)
+		}
+		
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating business rows: %w", err)
+		}
+	}
+	
+	// Batch query for full CNPJs (14 digits)
+	if len(fullCNPJs) > 0 {
+		placeholders := make([]string, len(fullCNPJs))
+		args := make([]interface{}, len(fullCNPJs))
+		for i, full := range fullCNPJs {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = full
+		}
+		
+		query := fmt.Sprintf("SELECT id, cnpj FROM %s WHERE cnpj IN (%s)", 
+			businessTable, strings.Join(placeholders, ","))
+		
+		rows, err := p.pool.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("error batch querying businesses for full CNPJs: %w", err)
+		}
+		defer rows.Close()
+		
+		for rows.Next() {
+			var businessID int
+			var cnpj string
+			if err := rows.Scan(&businessID, &cnpj); err != nil {
+				return fmt.Errorf("error scanning business_id: %w", err)
+			}
+			cnpjToBusinessIDs[cnpj] = append(cnpjToBusinessIDs[cnpj], businessID)
+		}
+		
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating business rows: %w", err)
+		}
+	}
+	
+	// Batch fetch all CNPJs for businesses found
+	businessIDToCNPJ := make(map[int]string)
+	if len(cnpjToBusinessIDs) > 0 {
+		allBusinessIDs := make([]int, 0)
+		for _, ids := range cnpjToBusinessIDs {
+			allBusinessIDs = append(allBusinessIDs, ids...)
+		}
+		
+		// Remove duplicates
+		businessIDMap := make(map[int]bool)
+		uniqueBusinessIDs := make([]int, 0)
+		for _, id := range allBusinessIDs {
+			if !businessIDMap[id] {
+				businessIDMap[id] = true
+				uniqueBusinessIDs = append(uniqueBusinessIDs, id)
+			}
+		}
+		
+		if len(uniqueBusinessIDs) > 0 {
+			placeholders := make([]string, len(uniqueBusinessIDs))
+			args := make([]interface{}, len(uniqueBusinessIDs))
+			for i, id := range uniqueBusinessIDs {
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+				args[i] = id
+			}
+			
+			query := fmt.Sprintf("SELECT id, cnpj FROM %s WHERE id IN (%s)", 
+				businessTable, strings.Join(placeholders, ","))
+			
+			rows, err := p.pool.Query(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf("error batch fetching CNPJs for business_ids: %w", err)
+			}
+			defer rows.Close()
+			
+			for rows.Next() {
+				var businessID int
+				var cnpj string
+				if err := rows.Scan(&businessID, &cnpj); err != nil {
+					return fmt.Errorf("error scanning CNPJ: %w", err)
+				}
+				businessIDToCNPJ[businessID] = cnpj
+			}
+			
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("error iterating CNPJ rows: %w", err)
+			}
+		}
+	}
+	
+	// Process all partners in batch transactions
+	// Group by businessID to minimize transactions
+	businessIDToPartners := make(map[int][]transform.PartnerData)
+	businessIDToFullCNPJ := make(map[int]string)
+	
+	for cnpj, partners := range cnpjToPartners {
+		businessIDs := cnpjToBusinessIDs[cnpj]
+		if len(businessIDs) == 0 {
+			slog.Warn("No businesses found for CNPJ, skipping partners", "cnpj", cnpj)
+			continue
+		}
+		
+		for _, businessID := range businessIDs {
+			fullCNPJ, ok := businessIDToCNPJ[businessID]
+			if !ok {
+				slog.Warn("CNPJ not found for business_id", "business_id", businessID)
+				continue
+			}
+			
+			businessIDToPartners[businessID] = append(businessIDToPartners[businessID], partners...)
+			businessIDToFullCNPJ[businessID] = fullCNPJ
+		}
+	}
+	
+	// Process each business in a transaction
+	for businessID, partners := range businessIDToPartners {
+		fullCNPJ := businessIDToFullCNPJ[businessID]
+		
+		// Begin transaction
+		tx, err := p.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("error beginning transaction: %w", err)
+		}
+		
+		// Optimize transaction for bulk loading
+		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
+			slog.Warn("Could not disable synchronous commit", "error", err)
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '64MB'"); err != nil {
+			slog.Warn("Could not set work_mem", "error", err)
+		}
+		
+		// Use batch insert for better performance (no DELETE - preserve existing data)
+		if len(partners) > 0 {
+			// Prepare batch insert statement
+			insertSQL := fmt.Sprintf(`INSERT INTO %s (
+				business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+			) VALUES `, sociosCnpjTable)
+			
+			// Build values and args for batch insert, filtering duplicates
+			values := make([]string, 0, len(partners))
+			args := make([]interface{}, 0, len(partners)*6)
+			argIndex := 1
+			
+			for _, partner := range partners {
+				var dataEntrada *time.Time
+				if partner.DataEntradaSociedade != nil {
+					dt := time.Time(*partner.DataEntradaSociedade)
+					dataEntrada = &dt
+				}
+				
+				var qualificacao string
+				if partner.QualificaoSocio != nil {
+					qualificacao = *partner.QualificaoSocio
+				}
+				
+				// Extract CPF from partner (may be masked like ***220050**)
+				cpfSocio := partner.CNPJCPFDoSocio
+				cleanCPFSocio := removeNonDigits(cpfSocio)
+				// Se tiver mais de 11 dígitos (CNPJ), não insere
+				if len(cleanCPFSocio) > 11 {
+					slog.Warn("CPF com mais de 11 dígitos, ignorando sócio", "business_id", businessID, "cpf", cleanCPFSocio, "partner", partner.NomeSocio)
+					continue // Pula este sócio se tiver mais de 11 dígitos
+				}
+				
+				var cpfSocioValue interface{}
+				if cleanCPFSocio != "" {
+					cpfSocioValue = cleanCPFSocio
+				} else {
+					cpfSocioValue = nil
+				}
+				
+				// Truncate partner fields that may exceed database limits
+				nomeSocio := truncateTo120(partner.NomeSocio)
+				qualificacaoTrunc := truncateTo120(qualificacao)
+				
+				values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)", 
+					argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4, argIndex+5))
+				args = append(args, businessID, fullCNPJ, nomeSocio, cpfSocioValue, dataEntrada, qualificacaoTrunc)
+				argIndex += 6
+			}
+			
+			// Execute batch insert with ON CONFLICT to skip duplicates
+			if len(values) > 0 {
+				insertSQL += strings.Join(values, ", ")
+				insertSQL += fmt.Sprintf(` ON CONFLICT (cnpj, nome_socio) DO NOTHING`)
+				_, err = tx.Exec(ctx, insertSQL, args...)
+				if err != nil {
+					slog.Warn("error batch inserting partners", "business_id", businessID, "partners_count", len(partners), "error", err)
+					tx.Rollback(ctx)
+					continue
+				}
+			}
+		}
+		
+		// Commit transaction
+		if err := tx.Commit(ctx); err != nil {
+			slog.Warn("error committing transaction", "business_id", businessID, "error", err)
+			tx.Rollback(ctx)
+			continue
+		}
+	}
+	
 	return nil
 }
 

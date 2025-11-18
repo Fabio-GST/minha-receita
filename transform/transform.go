@@ -13,15 +13,15 @@ import (
 const (
 	// MaxParallelDBQueries is the default for maximum number of parallels save
 	// queries sent to the database
-	MaxParallelDBQueries = 8
+	MaxParallelDBQueries = 4
 
 	// MaxParallelKVWrites is the default for maximum number of parallels
 	// writes on the key-value storage (Badger)
-	MaxParallelKVWrites = 1024
+	MaxParallelKVWrites = 256
 
 	// BatchSize determines the size of the batches used to create the initial JSON
 	// data in the database.
-	BatchSize = 8192
+	BatchSize = 2048
 )
 
 var extraIdexes = [...]string{
@@ -38,6 +38,7 @@ type database interface {
 	PreLoad() error
 	CreateCompanies([][]string) error
 	CreateCompaniesStructured([][]string) error
+	CreateCompaniesStructuredDirect([]Company) error // Optimized version that doesn't require JSON
 	PostLoad() error
 	CreateExtraIndexes([]string) error
 	MetaSave(string, string) error
@@ -126,7 +127,7 @@ func Transform(dir string, db database, maxDB, maxKV, s int, p bool, structured 
 	if err != nil {
 		return fmt.Errorf("error creating look up tables from %s: %w", dir, err)
 	}
-	if err := createKeyValueStorage(dir, pth, l, 1024); err != nil {
+	if err := createKeyValueStorage(dir, pth, l, maxKV); err != nil {
 		return err
 	}
 	if err := createJSONs(dir, pth, db, l, maxDB, s, p, structured); err != nil {

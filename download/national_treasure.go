@@ -1,7 +1,7 @@
 package download
 
 import (
-	"encoding/json/v2"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"

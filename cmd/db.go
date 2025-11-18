@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/cuducos/minha-receita/db"
+	"github.com/cuducos/minha-receita/transform"
 )
 
 var (
@@ -22,6 +23,7 @@ type database interface {
 	PreLoad() error
 	CreateCompanies([][]string) error
 	CreateCompaniesStructured([][]string) error
+	CreateCompaniesStructuredDirect([]transform.Company) error
 	PostLoad() error
 	MetaSave(string, string) error
 	// extra indexes

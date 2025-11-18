@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
-	"encoding/json/v2"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -234,16 +234,245 @@ func situacaoCadastralToString(code *int) string {
 	}
 }
 
-// CreateCompaniesStructured inserts companies into business and business_partners tables
-func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
+// CreateCompaniesStructuredDirect inserts companies directly without JSON conversion
+// This is more memory-efficient than CreateCompaniesStructured
+func (p *PostgreSQL) CreateCompaniesStructuredDirect(batch []transform.Company) error {
 	ctx := context.Background()
 	
-	// Begin transaction
+	// Begin transaction with optimized settings for bulk loading
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("error beginning transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	
+	// Optimize transaction for bulk loading
+	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
+		slog.Warn("Could not disable synchronous commit", "error", err)
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '256MB'"); err != nil {
+		slog.Warn("Could not set work_mem", "error", err)
+	}
+
+	// Prepare statements
+	insertBusinessSQL := `INSERT INTO business (
+		cnpj, razao_social, nome_fantasia, situacao_cadastral,
+		cnae_principal, tipo_cnae_principal, cnaes_secundarios,
+		capital_social, natureza_juridica, qualificacao_responsavel,
+		porte_empresa, identificador_matriz_filial,
+		data_situacao_cadastral, motivo_situacao_cadastral,
+		data_inicio_atividade, email,
+		endereco_cep, endereco_numero, endereco_logradouro,
+		endereco_bairro, endereco_cidade, endereco_uf,
+		endereco_tipo, endereco_complemento, telefones
+	) VALUES (
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+		$11, $12, $13, $14, $15, $16, $17, $18, $19,
+		$20, $21, $22, $23, $24, $25
+	)
+	ON CONFLICT (cnpj) 
+	DO UPDATE SET 
+		razao_social = EXCLUDED.razao_social,
+		nome_fantasia = EXCLUDED.nome_fantasia,
+		situacao_cadastral = EXCLUDED.situacao_cadastral,
+		cnae_principal = EXCLUDED.cnae_principal,
+		tipo_cnae_principal = EXCLUDED.tipo_cnae_principal,
+		cnaes_secundarios = EXCLUDED.cnaes_secundarios,
+		capital_social = EXCLUDED.capital_social,
+		natureza_juridica = EXCLUDED.natureza_juridica,
+		qualificacao_responsavel = EXCLUDED.qualificacao_responsavel,
+		porte_empresa = EXCLUDED.porte_empresa,
+		identificador_matriz_filial = EXCLUDED.identificador_matriz_filial,
+		data_situacao_cadastral = EXCLUDED.data_situacao_cadastral,
+		motivo_situacao_cadastral = EXCLUDED.motivo_situacao_cadastral,
+		data_inicio_atividade = EXCLUDED.data_inicio_atividade,
+		email = EXCLUDED.email,
+		endereco_cep = EXCLUDED.endereco_cep,
+		endereco_numero = EXCLUDED.endereco_numero,
+		endereco_logradouro = EXCLUDED.endereco_logradouro,
+		endereco_bairro = EXCLUDED.endereco_bairro,
+		endereco_cidade = EXCLUDED.endereco_cidade,
+		endereco_uf = EXCLUDED.endereco_uf,
+		endereco_tipo = EXCLUDED.endereco_tipo,
+		endereco_complemento = EXCLUDED.endereco_complemento,
+		telefones = EXCLUDED.telefones,
+		updated_at = now()
+	RETURNING id`
+
+	deletePartnersSQL := `DELETE FROM socios_cnpj WHERE business_id = $1`
+
+	for _, company := range batch {
+		// Clean CNPJ
+		cleanCNPJ := removeNonDigits(company.CNPJ)
+		if len(cleanCNPJ) != 14 {
+			slog.Warn("invalid CNPJ length", "cnpj", cleanCNPJ)
+			continue
+		}
+
+		// Prepare business data (same logic as CreateCompaniesStructured)
+		var capitalSocial *float64
+		if company.CapitalSocial != nil {
+			cs := float64(*company.CapitalSocial)
+			capitalSocial = &cs
+		}
+
+		var naturezaJuridica string
+		if company.CodigoNaturezaJuridica != nil {
+			naturezaJuridica = strconv.Itoa(*company.CodigoNaturezaJuridica)
+		}
+
+		var qualificacaoResponsavel string
+		if company.QualificacaoDoResponsavel != nil {
+			qualificacaoResponsavel = strconv.Itoa(*company.QualificacaoDoResponsavel)
+		}
+
+		var porteEmpresa string
+		if company.CodigoPorte != nil {
+			porteEmpresa = strconv.Itoa(*company.CodigoPorte)
+		}
+
+		identificadorMatrizFilial := "MATRIZ"
+		if company.DescricaoMatrizFilial != nil {
+			identificadorMatrizFilial = *company.DescricaoMatrizFilial
+		} else if company.IdentificadorMatrizFilial != nil && *company.IdentificadorMatrizFilial == 2 {
+			identificadorMatrizFilial = "FILIAL"
+		}
+
+		var motivoSituacaoCadastral string
+		if company.MotivoSituacaoCadastral != nil {
+			motivoSituacaoCadastral = strconv.Itoa(*company.MotivoSituacaoCadastral)
+		}
+
+		cleanCEP := removeNonDigits(company.CEP)
+		if len(cleanCEP) > 8 {
+			cleanCEP = cleanCEP[:8]
+		}
+
+		var enderecoTipo int16 = 0
+		if company.DescricaoTipoDeLogradouro != "" {
+			enderecoTipo = 0
+		}
+
+		var municipio string
+		if company.Municipio != nil {
+			municipio = *company.Municipio
+		}
+
+		// Insert/Update business
+		var businessID int64
+		err := tx.QueryRow(ctx, insertBusinessSQL,
+			cleanCNPJ,
+			company.RazaoSocial,
+			company.NomeFantasia,
+			situacaoCadastralToString(company.SituacaoCadastral),
+			formatCNAEPrincipal(company.CNAEFiscal),
+			getStringValue(company.CNAEFiscalDescricao),
+			formatSecondaryCNAEs(company.CNAESecundarios),
+			capitalSocial,
+			naturezaJuridica,
+			qualificacaoResponsavel,
+			porteEmpresa,
+			identificadorMatrizFilial,
+			convertDate(company.DataSituacaoCadastral),
+			motivoSituacaoCadastral,
+			convertDate(company.DataInicioAtividade),
+			getStringValue(company.Email),
+			cleanCEP,
+			company.Numero,
+			company.Logradouro,
+			company.Bairro,
+			municipio,
+			company.UF,
+			enderecoTipo,
+			company.Complemento,
+			formatPhones(&company),
+		).Scan(&businessID)
+
+		if err != nil {
+			slog.Error("error inserting business", "cnpj", cleanCNPJ, "error", err)
+			continue
+		}
+
+		// Delete existing partners
+		_, err = tx.Exec(ctx, deletePartnersSQL, businessID)
+		if err != nil {
+			slog.Warn("error deleting existing partners", "business_id", businessID, "error", err)
+		}
+
+		// Insert partners
+		for _, partner := range company.QuadroSocietario {
+			var dataEntrada *time.Time
+			if partner.DataEntradaSociedade != nil {
+				dt := time.Time(*partner.DataEntradaSociedade)
+				dataEntrada = &dt
+			}
+
+			var qualificacao string
+			if partner.QualificaoSocio != nil {
+				qualificacao = *partner.QualificaoSocio
+			}
+
+			cpfSocio := partner.CNPJCPFDoSocio
+			cleanCPFSocio := removeNonDigits(cpfSocio)
+			if len(cleanCPFSocio) != 11 {
+				cleanCPFSocio = ""
+			}
+
+			var cpfSocioValue interface{}
+			if cleanCPFSocio != "" {
+				cpfSocioValue = cleanCPFSocio
+			} else {
+				cpfSocioValue = nil
+			}
+
+			_, err = tx.Exec(ctx, `INSERT INTO socios_cnpj (
+				business_id, cnpj, nome_socio, cpf_socio, data_entrada_sociedade, qualificacao
+			) VALUES ($1, $2, $3, $4, $5, $6)`,
+				businessID,
+				cleanCNPJ,
+				partner.NomeSocio,
+				cpfSocioValue,
+				dataEntrada,
+				qualificacao,
+			)
+			if err != nil {
+				slog.Warn("error inserting partner", "business_id", businessID, "partner", partner.NomeSocio, "error", err)
+			}
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("error committing transaction: %w", err)
+	}
+
+	return nil
+}
+
+// CreateCompaniesStructured inserts companies into business and business_partners tables
+// This method creates JSON first (for compatibility), but CreateCompaniesStructuredDirect is preferred
+func (p *PostgreSQL) CreateCompaniesStructured(batch [][]string) error {
+	ctx := context.Background()
+	
+	// Begin transaction with optimized settings for bulk loading
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("error beginning transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	
+	// Optimize transaction for bulk loading: disable synchronous commit temporarily
+	// This reduces I/O and improves performance during bulk inserts
+	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
+		slog.Warn("Could not disable synchronous commit", "error", err)
+		// Continue anyway
+	}
+	
+	// Set work_mem higher for this transaction to reduce disk usage
+	if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '256MB'"); err != nil {
+		slog.Warn("Could not set work_mem", "error", err)
+		// Continue anyway
+	}
 
 	// Prepare statements
 	insertBusinessSQL := `INSERT INTO business (
@@ -607,28 +836,277 @@ func (p *PostgreSQL) Search(ctx context.Context, q *Query) (string, error) {
 }
 
 // PreLoad runs before starting to load data into the database. Currently it
-// disables autovacuum on PostgreSQL.
+// disables autovacuum on PostgreSQL and optimizes storage.
 func (p *PostgreSQL) PreLoad() error {
-	s, err := p.renderTemplate("pre_load")
+	// Optimize storage before loading: run VACUUM to reclaim space
+	// Use VACUUM (not VACUUM FULL) to avoid blocking and reduce disk usage
+	slog.Info("Running VACUUM to optimize storage before loading...")
+	vacuumSQL := "VACUUM"
+	if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
+		slog.Warn("Could not run VACUUM before loading", "error", err)
+		// Continue anyway, not critical - VACUUM can fail if disk is full
+	} else {
+		slog.Info("VACUUM completed successfully")
+		// Run ANALYZE separately to update statistics
+		analyzeSQL := "ANALYZE"
+		if _, err := p.pool.Exec(context.Background(), analyzeSQL); err != nil {
+			slog.Warn("Could not run ANALYZE", "error", err)
+		}
+	}
+	
+	// Disable autovacuum during bulk loading to save space and improve performance
+	slog.Info("Disabling autovacuum for bulk loading...")
+	disableAutovacuumSQL := fmt.Sprintf(`
+		ALTER TABLE %s.business SET (autovacuum_enabled = false);
+		ALTER TABLE %s.socios_cnpj SET (autovacuum_enabled = false);
+	`, p.schema, p.schema)
+	if _, err := p.pool.Exec(context.Background(), disableAutovacuumSQL); err != nil {
+		slog.Warn("Could not disable autovacuum", "error", err)
+		// Continue anyway
+	}
+	
+	// Check which table exists: business (structured) or cnpj (JSON)
+	// Try business table first (structured mode)
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	cnpjTable := p.CompanyTableFullName()
+	
+	var checkQuery string
+	
+	// Check if business table exists
+	checkQuery = `SELECT EXISTS (
+		SELECT FROM information_schema.tables 
+		WHERE table_schema = $1 AND table_name = 'business'
+	)`
+	var businessExists bool
+	err := p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessExists)
 	if err != nil {
-		return fmt.Errorf("error rendering pre-load template: %w", err)
+		return fmt.Errorf("error checking if business table exists: %w", err)
 	}
-	if _, err := p.pool.Exec(context.Background(), s); err != nil {
-		return fmt.Errorf("error during pre load: %s\n%w", s, err)
+	
+	if businessExists {
+		// In structured mode, we need to set UNLOGGED on all related tables
+		// Order matters: tables referenced by business must be UNLOGGED first
+		// The error shows business references socios_cnpj, so socios_cnpj must be first
+		// Order: 1. socios_cnpj, 2. business_partners, 3. business
+		
+		// Step 1: Set socios_cnpj to UNLOGGED first (referenced by business)
+		checkQuery = `SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = $1 AND table_name = 'socios_cnpj'
+		)`
+		var sociosCnpjExists bool
+		err = p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&sociosCnpjExists)
+		if err == nil && sociosCnpjExists {
+			sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+			sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", sociosCnpjTable)
+			if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+				slog.Warn("Could not set socios_cnpj to UNLOGGED", "error", err)
+			} else {
+				slog.Debug("Set socios_cnpj table to UNLOGGED")
+			}
+		}
+		
+		// Step 2: Set business_partners to UNLOGGED (if it exists and is referenced by business)
+		checkQuery = `SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = $1 AND table_name = 'business_partners'
+		)`
+		var businessPartnersExists bool
+		err = p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessPartnersExists)
+		if err == nil && businessPartnersExists {
+			businessPartnersTable := fmt.Sprintf("%s.business_partners", p.schema)
+			sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", businessPartnersTable)
+			if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+				slog.Warn("Could not set business_partners to UNLOGGED", "error", err)
+			} else {
+				slog.Debug("Set business_partners table to UNLOGGED")
+			}
+		}
+		
+		// Step 3: Set business to UNLOGGED (after all tables it references)
+		sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", businessTable)
+		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+			return fmt.Errorf("error during pre load: %s\n%w", sql, err)
+		}
+		slog.Debug("Set business table to UNLOGGED", "table", businessTable)
+		
+		return nil
 	}
+	
+	// Check if cnpj table exists (JSON mode)
+	checkQuery = `SELECT EXISTS (
+		SELECT FROM information_schema.tables 
+		WHERE table_schema = $1 AND table_name = $2
+	)`
+	var cnpjExists bool
+	err = p.pool.QueryRow(context.Background(), checkQuery, p.schema, p.CompanyTableName).Scan(&cnpjExists)
+	if err != nil {
+		return fmt.Errorf("error checking if cnpj table exists: %w", err)
+	}
+	
+	if cnpjExists {
+		// Verify the table exists before trying to alter it
+		verifyQuery := `SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = $1 AND table_name = $2
+		)`
+		var tableExists bool
+		err = p.pool.QueryRow(context.Background(), verifyQuery, p.schema, p.CompanyTableName).Scan(&tableExists)
+		if err != nil {
+			return fmt.Errorf("error verifying table exists: %w", err)
+		}
+		
+		if !tableExists {
+			slog.Warn("Table does not exist yet, skipping UNLOGGED optimization", "table", cnpjTable)
+			return nil
+		}
+		
+		// Apply UNLOGGED to the table
+		sql := fmt.Sprintf("ALTER TABLE %s SET UNLOGGED", cnpjTable)
+		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+			return fmt.Errorf("error during pre load: %s\n%w", sql, err)
+		}
+		return nil
+	}
+	
+	// If neither exists, skip optimization
+	slog.Warn("No tables found, skipping UNLOGGED optimization")
 	return nil
 }
 
 // PostLoad runs after loading data into the database. Currently it re-enables
-// autovacuum on PostgreSQL.
+// autovacuum on PostgreSQL and optimizes storage.
 func (p *PostgreSQL) PostLoad() error {
-	s, err := p.renderTemplate("post_load")
+	// Check which table exists: business (structured) or cnpj (JSON)
+	// Try business table first (structured mode)
+	businessTable := fmt.Sprintf("%s.business", p.schema)
+	cnpjTable := p.CompanyTableFullName()
+	
+	// Check if business table exists
+	checkQuery := `SELECT EXISTS (
+		SELECT FROM information_schema.tables 
+		WHERE table_schema = $1 AND table_name = 'business'
+	)`
+	var businessExists bool
+	err := p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessExists)
 	if err != nil {
-		return fmt.Errorf("error rendering post-load template: %w", err)
+		return fmt.Errorf("error checking if business table exists: %w", err)
 	}
-	if _, err := p.pool.Exec(context.Background(), s); err != nil {
-		return fmt.Errorf("error during post load: %s\n%w", s, err)
+	
+	// Re-enable autovacuum after loading
+	slog.Info("Re-enabling autovacuum after loading...")
+	enableAutovacuumSQL := fmt.Sprintf(`
+		ALTER TABLE %s.business SET (autovacuum_enabled = true);
+		ALTER TABLE %s.socios_cnpj SET (autovacuum_enabled = true);
+	`, p.schema, p.schema)
+	if _, err := p.pool.Exec(context.Background(), enableAutovacuumSQL); err != nil {
+		slog.Warn("Could not re-enable autovacuum", "error", err)
+		// Continue anyway
 	}
+	
+	if businessExists {
+		// In structured mode, set LOGGED in reverse order of UNLOGGED
+		// Order: 1. business first, 2. business_partners, 3. socios_cnpj
+		
+		// Step 1: Set business to LOGGED first
+		sql := fmt.Sprintf("ALTER TABLE %s SET LOGGED", businessTable)
+		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+			return fmt.Errorf("error during post load: %s\n%w", sql, err)
+		}
+		slog.Debug("Set business table to LOGGED", "table", businessTable)
+		
+		// Step 2: Set business_partners to LOGGED
+		checkQuery = `SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = $1 AND table_name = 'business_partners'
+		)`
+		var businessPartnersExists bool
+		err = p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&businessPartnersExists)
+		if err == nil && businessPartnersExists {
+			businessPartnersTable := fmt.Sprintf("%s.business_partners", p.schema)
+			sql := fmt.Sprintf("ALTER TABLE %s SET LOGGED", businessPartnersTable)
+			if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+				slog.Warn("Could not set business_partners to LOGGED", "error", err)
+			} else {
+				slog.Debug("Set business_partners table to LOGGED")
+			}
+		}
+		
+		// Step 3: Set socios_cnpj to LOGGED last
+		checkQuery = `SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = $1 AND table_name = 'socios_cnpj'
+		)`
+		var sociosCnpjExists bool
+		err = p.pool.QueryRow(context.Background(), checkQuery, p.schema).Scan(&sociosCnpjExists)
+		if err == nil && sociosCnpjExists {
+			sociosCnpjTable := fmt.Sprintf("%s.socios_cnpj", p.schema)
+			sql := fmt.Sprintf("ALTER TABLE %s SET LOGGED", sociosCnpjTable)
+			if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+				slog.Warn("Could not set socios_cnpj to LOGGED", "error", err)
+			} else {
+				slog.Debug("Set socios_cnpj table to LOGGED")
+			}
+		}
+		
+		// Run VACUUM to reclaim space after loading
+		// Use VACUUM (not VACUUM FULL) to avoid blocking and reduce disk usage
+		slog.Info("Running VACUUM to optimize storage after loading...")
+		vacuumSQL := fmt.Sprintf("VACUUM %s.business, %s.socios_cnpj", p.schema, p.schema)
+		if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
+			slog.Warn("Could not run VACUUM after loading", "error", err)
+			// Continue anyway - VACUUM can fail if disk is full
+		} else {
+			slog.Info("VACUUM completed successfully")
+			// Run ANALYZE separately to update statistics
+			analyzeSQL := fmt.Sprintf("ANALYZE %s.business, %s.socios_cnpj", p.schema, p.schema)
+			if _, err := p.pool.Exec(context.Background(), analyzeSQL); err != nil {
+				slog.Warn("Could not run ANALYZE", "error", err)
+			}
+		}
+		
+		return nil
+	}
+	
+	// Check if cnpj table exists (JSON mode)
+	checkQuery = `SELECT EXISTS (
+		SELECT FROM information_schema.tables 
+		WHERE table_schema = $1 AND table_name = $2
+	)`
+	var cnpjExists bool
+	err = p.pool.QueryRow(context.Background(), checkQuery, p.schema, p.CompanyTableName).Scan(&cnpjExists)
+	if err != nil {
+		return fmt.Errorf("error checking if cnpj table exists: %w", err)
+	}
+	
+	if cnpjExists {
+		// Apply LOGGED to the table
+		sql := fmt.Sprintf("ALTER TABLE %s SET LOGGED", cnpjTable)
+		if _, err := p.pool.Exec(context.Background(), sql); err != nil {
+			return fmt.Errorf("error during post load: %s\n%w", sql, err)
+		}
+		
+		// Run VACUUM to reclaim space after loading
+		// Use VACUUM (not VACUUM FULL) to avoid blocking and reduce disk usage
+		slog.Info("Running VACUUM to optimize storage after loading...")
+		vacuumSQL := fmt.Sprintf("VACUUM %s", cnpjTable)
+		if _, err := p.pool.Exec(context.Background(), vacuumSQL); err != nil {
+			slog.Warn("Could not run VACUUM after loading", "error", err)
+			// Continue anyway - VACUUM can fail if disk is full
+		} else {
+			slog.Info("VACUUM completed successfully")
+			// Run ANALYZE separately to update statistics
+			analyzeSQL := fmt.Sprintf("ANALYZE %s", cnpjTable)
+			if _, err := p.pool.Exec(context.Background(), analyzeSQL); err != nil {
+				slog.Warn("Could not run ANALYZE", "error", err)
+			}
+		}
+		
+		return nil
+	}
+	
+	// If neither exists, skip optimization
+	slog.Warn("No tables found, skipping LOGGED optimization")
 	return nil
 }
 

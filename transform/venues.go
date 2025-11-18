@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
+	"time"
 
 	"github.com/cuducos/go-cnpj"
 	"github.com/schollz/progressbar/v3"
@@ -25,24 +27,27 @@ func (t *venuesTask) saveBatch(b []Company) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	s := make([][]string, len(b))
-	for i, c := range b {
-		j, err := c.JSON()
-		if err != nil {
-			return 0, fmt.Errorf("error getting company %s as json: %w", cnpj.Mask(c.CNPJ), err)
-		}
-		s[i] = []string{c.CNPJ, j}
-	}
 	var err error
 	if t.structured {
-		err = t.db.CreateCompaniesStructured(s)
+		// Optimized path: pass Company objects directly without creating JSON
+		// This saves memory and CPU by avoiding JSON marshaling/unmarshaling
+		err = t.db.CreateCompaniesStructuredDirect(b)
 	} else {
+		// JSON mode: create JSON strings for storage
+		s := make([][]string, len(b))
+		for i, c := range b {
+			j, err := c.JSON()
+			if err != nil {
+				return 0, fmt.Errorf("error getting company %s as json: %w", cnpj.Mask(c.CNPJ), err)
+			}
+			s[i] = []string{c.CNPJ, j}
+		}
 		err = t.db.CreateCompanies(s)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("error saving companies: %w", err)
 	}
-	return len(s), nil
+	return len(b), nil
 }
 
 func (t *venuesTask) consumeRows(ctx context.Context, q <-chan []string, done chan<- int) error {
@@ -117,6 +122,19 @@ func (t *venuesTask) run(m int) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Periodic garbage collection to reduce memory usage
+	gcTicker := time.NewTicker(30 * time.Second)
+	defer gcTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-gcTicker.C:
+				runtime.GC()
+			}
+		}
+	}()
 	var g errgroup.Group
 	q := make(chan []string)
 	g.Go(func() error {

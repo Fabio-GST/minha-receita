@@ -253,6 +253,11 @@ func newBadgerStorage(dir string, ro bool) (*badgerStorage, error) {
 	if ro && runtime.GOOS != "windows" {
 		opt = opt.WithReadOnly(ro)
 	}
+	// Optimize memory usage for large datasets
+	opt = opt.WithNumMemtables(1)           // Reduce from default 5 to 1
+	opt = opt.WithNumLevelZeroTables(1)     // Reduce from default 5 to 1
+	opt = opt.WithNumLevelZeroTablesStall(2) // Reduce from default 10 to 2
+	opt = opt.WithValueLogMaxEntries(100000) // Limit value log entries
 	slog.Debug("Creating temporary key-value storage", "path", dir)
 	if os.Getenv("DEBUG") == "" {
 		opt = opt.WithLogger(&noLogger{})

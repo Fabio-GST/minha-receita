@@ -1,7 +1,7 @@
 package transform
 
 import (
-	"encoding/json/v2"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -44,6 +44,19 @@ func (i inMemoryDB) CreateCompanies(cs [][]string) error {
 
 func (i inMemoryDB) CreateCompaniesStructured(cs [][]string) error {
 	// For testing purposes, structured mode works the same as regular mode
+	return i.CreateCompanies(cs)
+}
+
+func (i inMemoryDB) CreateCompaniesStructuredDirect(batch []Company) error {
+	// For testing purposes, convert to JSON format
+	cs := make([][]string, len(batch))
+	for i, c := range batch {
+		j, err := c.JSON()
+		if err != nil {
+			return err
+		}
+		cs[i] = []string{c.CNPJ, j}
+	}
 	return i.CreateCompanies(cs)
 }
 

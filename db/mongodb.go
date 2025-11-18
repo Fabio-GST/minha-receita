@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"encoding/json/v2"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -88,6 +88,11 @@ func (m *MongoDB) Drop() error {
 // CreateCompaniesStructured is not supported for MongoDB (relational structure required)
 func (m *MongoDB) CreateCompaniesStructured(batch [][]string) error {
 	return fmt.Errorf("CreateCompaniesStructured is not supported for MongoDB - use PostgreSQL for structured tables")
+}
+
+// CreateCompaniesStructuredDirect is not supported for MongoDB (relational structure required)
+func (m *MongoDB) CreateCompaniesStructuredDirect(batch []transform.Company) error {
+	return fmt.Errorf("CreateCompaniesStructuredDirect is not supported for MongoDB - use PostgreSQL for structured tables")
 }
 
 // CreateCompanies writes a batch of company data to MongoDB

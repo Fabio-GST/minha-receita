@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -33,7 +34,9 @@ var filePattern = regexp.MustCompile(`href="(\w+\d?\.zip)"`)
 var taxFilePattern = regexp.MustCompile(`href="((Imune|Lucro).+\.zip)"`)
 
 func get(url string) (string, error) {
-	c := http.Client{}
+	c := http.Client{
+		Timeout: 10 * time.Minute, // Increased timeout for slow government servers
+	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating request %s: %w", url, err)

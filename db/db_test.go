@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"encoding/json/v2"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"

@@ -1,7 +1,7 @@
 package transform
 
 import (
-	"encoding/json/v2"
+	"encoding/json"
 	"reflect"
 	"testing"
 

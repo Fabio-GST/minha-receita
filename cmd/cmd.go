@@ -107,6 +107,7 @@ func CLI() *cobra.Command {
 		createExtraIndexesCmd,
 		transformCLI(),
 		sampleCLI(),
+		exportCSVCLI(),
 	)
 	if os.Getenv("DEBUG") != "" {
 		rootCmd.AddCommand(addDataDir(transformNextCmd))

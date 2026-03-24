@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Read(//usr/local/go/**)",
+      "Read(//c/Users/gusta/go/**)",
+      "Bash(find /c /d /e -name go.exe -maxdepth 5)"
+    ]
+  }
+}

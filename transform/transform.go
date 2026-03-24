@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/cuducos/minha-receita/download"
@@ -96,6 +97,20 @@ func createJSONs(dir string, pth string, db database, l lookups, maxDB, batchSiz
 	return saveUpdatedAt(db, dir)
 }
 
+func clampParallelFor32Bit(maxDB, maxKV int) (int, int) {
+	if runtime.GOARCH != "386" {
+		return maxDB, maxKV
+	}
+	if maxDB > 2 {
+		maxDB = 2
+	}
+	if maxKV > 128 {
+		maxKV = 128
+	}
+	slog.Info("32-bit build detected: using lower parallelism for Badger stability", "max_parallel_venues", maxDB, "max_parallel_kv", maxKV)
+	return maxDB, maxKV
+}
+
 func postLoad(db database) error {
 	slog.Info("Consolidating the database…")
 	if err := db.PostLoad(); err != nil {
@@ -113,6 +128,7 @@ func postLoad(db database) error {
 // Transform the downloaded files for company venues creating a database record
 // per CNPJ
 func Transform(dir string, db database, maxDB, maxKV, s int, p bool, structured bool) error {
+	maxDB, maxKV = clampParallelFor32Bit(maxDB, maxKV)
 	pth, err := os.MkdirTemp("", fmt.Sprintf("minha-receita-%s-*", time.Now().Format("20060102150405")))
 	if err != nil {
 		return fmt.Errorf("error creating temporary key-value storage: %w", err)
@@ -126,7 +142,7 @@ func Transform(dir string, db database, maxDB, maxKV, s int, p bool, structured 
 	if err != nil {
 		return fmt.Errorf("error creating look up tables from %s: %w", dir, err)
 	}
-	if err := createKeyValueStorage(dir, pth, l, 1024); err != nil {
+	if err := createKeyValueStorage(dir, pth, l, maxKV); err != nil {
 		return err
 	}
 	if err := createJSONs(dir, pth, db, l, maxDB, s, p, structured); err != nil {

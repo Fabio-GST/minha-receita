@@ -11,10 +11,11 @@ import (
 const testBaseCNPJ = "12345678"
 
 func newTestBadgerDB(t *testing.T) *badger.DB {
-	opt := badger.DefaultOptions(t.TempDir())
+	opt := applyPlatformBadgerOptions(badger.DefaultOptions(t.TempDir()))
+	opt = opt.WithLogger(&noLogger{})
 	db, err := badger.Open(opt)
 	if err != nil {
-		t.Fatal("could not create a badger database")
+		t.Fatalf("could not create a badger database: %v", err)
 	}
 	return db
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
@@ -107,6 +108,12 @@ func (*noLogger) Debugf(string, ...any)   {}
 
 func newBadger(dir string, ro bool) (*kv, error) {
 	opt := badger.DefaultOptions(dir).WithReadOnly(ro)
+	// Badger v4 double-maps vlog files (actual mmap = 2 * ValueLogFileSize).
+	// On Windows this easily exceeds available virtual address space, so we
+	// use a small value; Badger will simply roll over to more vlog files.
+	if runtime.GOOS == "windows" {
+		opt = opt.WithValueLogFileSize(32 << 20) // mmap per file ≈ 64MB
+	}
 	slog.Debug("Creating temporary key-value storage", "path", dir)
 	if os.Getenv("DEBUG") == "" {
 		opt = opt.WithLogger(&noLogger{})

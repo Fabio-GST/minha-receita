@@ -110,7 +110,7 @@ func TestNewCompany(t *testing.T) {
 	t.Run("with privacy", func(t *testing.T) {
 		kv, err := newBadgerStorage(t.TempDir(), false)
 		if err != nil {
-			t.Errorf("expected no error creating badger, got %s", err)
+			t.Fatalf("expected no error creating badger, got %s", err)
 		}
 		defer func() {
 			if err := kv.close(); err != nil {
@@ -119,7 +119,7 @@ func TestNewCompany(t *testing.T) {
 		}()
 		lookups, err := newLookups(testdata)
 		if err != nil {
-			t.Errorf("expected no errors creating look up tables, got %v", err)
+			t.Fatalf("expected no errors creating look up tables, got %v", err)
 		}
 		if err := kv.load(testdata, &lookups, 1024); err != nil {
 			t.Errorf("expected no error loading values to badger, got %s", err)
@@ -265,7 +265,7 @@ func TestNewCompany(t *testing.T) {
 	t.Run("without privacy", func(t *testing.T) {
 		kv, err := newBadgerStorage(t.TempDir(), false)
 		if err != nil {
-			t.Errorf("expected no error creating badger, got %s", err)
+			t.Fatalf("expected no error creating badger, got %s", err)
 		}
 		defer func() {
 			if err := kv.close(); err != nil {
@@ -274,7 +274,7 @@ func TestNewCompany(t *testing.T) {
 		}()
 		lookups, err := newLookups(testdata)
 		if err != nil {
-			t.Errorf("expected no errors creating look up tables, got %v", err)
+			t.Fatalf("expected no errors creating look up tables, got %v", err)
 		}
 		if err := kv.load(testdata, &lookups, 1024); err != nil {
 			t.Errorf("expected no error loading values to badger, got %s", err)

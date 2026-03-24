@@ -136,15 +136,15 @@ func (kv *badgerStorage) loadSource(ctx context.Context, s *source, l *lookups, 
 }
 
 func (kv *badgerStorage) load(dir string, l *lookups, m int) error {
-	srcs, t, err := newSources(dir, []sourceType{
-		base,
-		partners,
-		simpleTaxes,
-		noTaxes,
-		presumedProfit,
-		realProfit,
-		arbitratedProfit,
-	})
+	kinds := []sourceType{base, partners, simpleTaxes}
+	for _, opt := range []sourceType{noTaxes, presumedProfit, realProfit, arbitratedProfit} {
+		if ps, _ := pathsForSource(opt, dir); len(ps) > 0 {
+			kinds = append(kinds, opt)
+		} else {
+			slog.Info(fmt.Sprintf("No files found for %s, skipping.", string(opt)))
+		}
+	}
+	srcs, t, err := newSources(dir, kinds)
 	if err != nil {
 		return fmt.Errorf("could not load sources: %w", err)
 	}
@@ -174,65 +174,38 @@ func (kv *badgerStorage) load(dir string, l *lookups, m int) error {
 
 func (kv *badgerStorage) enrichCompany(c *Company) error {
 	n := cnpj.Base(c.CNPJ)
-	ps := make(chan []PartnerData)
-	bs := make(chan baseData)
-	st := make(chan simpleTaxesData)
-	tr := make(chan TaxRegimes)
-	errs := make(chan error)
-	go func() {
-		p, err := partnersOf(kv.db, n)
-		if err != nil {
-			errs <- err
-		}
-		ps <- p
-	}()
-	go func() {
-		v, err := baseOf(kv.db, n)
-		if err != nil {
-			errs <- err
-		}
-		bs <- v
-	}()
-	go func() {
-		t, err := simpleTaxesOf(kv.db, n)
-		if err != nil {
-			errs <- err
-		}
-		st <- t
-	}()
-	go func() {
-		t, err := taxRegimeOf(kv.db, c.CNPJ)
-		if err != nil {
-			errs <- err
-		}
-		tr <- t
-	}()
-	for range [4]int{} {
-		select {
-		case p := <-ps:
-			c.QuadroSocietario = p
-		case v := <-bs:
-			c.CodigoPorte = v.CodigoPorte
-			c.Porte = v.Porte
-			c.RazaoSocial = v.RazaoSocial
-			c.CodigoNaturezaJuridica = v.CodigoNaturezaJuridica
-			c.NaturezaJuridica = v.NaturezaJuridica
-			c.QualificacaoDoResponsavel = v.QualificacaoDoResponsavel
-			c.CapitalSocial = v.CapitalSocial
-			c.EnteFederativoResponsavel = v.EnteFederativoResponsavel
-		case t := <-st:
-			c.OpcaoPeloSimples = t.OpcaoPeloSimples
-			c.DataOpcaoPeloSimples = t.DataOpcaoPeloSimples
-			c.DataExclusaoDoSimples = t.DataExclusaoDoSimples
-			c.OpcaoPeloMEI = t.OpcaoPeloMEI
-			c.DataOpcaoPeloMEI = t.DataOpcaoPeloMEI
-			c.DataExclusaoDoMEI = t.DataExclusaoDoMEI
-		case t := <-tr:
-			c.RegimeTributario = t
-		case err := <-errs:
-			return fmt.Errorf("error enriching company: %w", err)
-		}
+	p, err := partnersOf(kv.db, n)
+	if err != nil {
+		return fmt.Errorf("error enriching company: %w", err)
 	}
+	c.QuadroSocietario = p
+	v, err := baseOf(kv.db, n)
+	if err != nil {
+		return fmt.Errorf("error enriching company: %w", err)
+	}
+	c.CodigoPorte = v.CodigoPorte
+	c.Porte = v.Porte
+	c.RazaoSocial = v.RazaoSocial
+	c.CodigoNaturezaJuridica = v.CodigoNaturezaJuridica
+	c.NaturezaJuridica = v.NaturezaJuridica
+	c.QualificacaoDoResponsavel = v.QualificacaoDoResponsavel
+	c.CapitalSocial = v.CapitalSocial
+	c.EnteFederativoResponsavel = v.EnteFederativoResponsavel
+	st, err := simpleTaxesOf(kv.db, n)
+	if err != nil {
+		return fmt.Errorf("error enriching company: %w", err)
+	}
+	c.OpcaoPeloSimples = st.OpcaoPeloSimples
+	c.DataOpcaoPeloSimples = st.DataOpcaoPeloSimples
+	c.DataExclusaoDoSimples = st.DataExclusaoDoSimples
+	c.OpcaoPeloMEI = st.OpcaoPeloMEI
+	c.DataOpcaoPeloMEI = st.DataOpcaoPeloMEI
+	c.DataExclusaoDoMEI = st.DataExclusaoDoMEI
+	tr, err := taxRegimeOf(kv.db, c.CNPJ)
+	if err != nil {
+		return fmt.Errorf("error enriching company: %w", err)
+	}
+	c.RegimeTributario = tr
 	return nil
 }
 
@@ -247,8 +220,28 @@ func (*noLogger) Warningf(string, ...any) {}
 func (*noLogger) Infof(string, ...any)    {}
 func (*noLogger) Debugf(string, ...any)   {}
 
+func applyPlatformBadgerOptions(opt badger.Options) badger.Options {
+	// Badger v4 double-maps vlog files (actual mmap = 2 * ValueLogFileSize).
+	// On Windows this easily exceeds available virtual address space, so we
+	// use a small value; Badger will simply roll over to more vlog files.
+	if runtime.GOOS == "windows" {
+		opt = opt.WithValueLogFileSize(32 << 20) // mmap per file ≈ 64MB
+	}
+	// 32-bit processes have a small virtual address space; trim caches and
+	// compactor pressure so export/transform can finish without OOM.
+	if runtime.GOARCH == "386" {
+		opt = opt.WithValueLogFileSize(16 << 20).
+			WithMemTableSize(8 << 20).
+			WithNumMemtables(1).
+			WithBlockCacheSize(8 << 20).
+			WithIndexCacheSize(8 << 20).
+			WithNumGoroutines(2)
+	}
+	return opt
+}
+
 func newBadgerStorage(dir string, ro bool) (*badgerStorage, error) {
-	opt := badger.DefaultOptions(dir)
+	opt := applyPlatformBadgerOptions(badger.DefaultOptions(dir))
 	// Badger read-only mode is not supported on Windows
 	if ro && runtime.GOOS != "windows" {
 		opt = opt.WithReadOnly(ro)

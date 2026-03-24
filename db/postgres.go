@@ -213,25 +213,13 @@ func formatCNAEPrincipal(cnae *int) string {
 	return fmt.Sprintf("%07d", *cnae)
 }
 
-// situacaoCadastralToString converts situacao cadastral code to string
+// situacaoCadastralToString returns the situacao cadastral as the numeric code
+// from the Receita Federal layout (ex.: 1 NULA, 2 ATIVA, 3 SUSPENSA, 4 INAPTA, 8 BAIXADA).
 func situacaoCadastralToString(code *int) string {
 	if code == nil {
 		return ""
 	}
-	switch *code {
-	case 1:
-		return "NULA"
-	case 2:
-		return "ATIVA"
-	case 3:
-		return "SUSPENSA"
-	case 4:
-		return "INAPTA"
-	case 8:
-		return "BAIXADA"
-	default:
-		return ""
-	}
+	return strconv.Itoa(*code)
 }
 
 // CreateCompaniesStructured inserts companies into business and business_partners tables

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/cuducos/minha-receita/transform"
 )
@@ -23,6 +24,7 @@ import (
 //	FROM business b
 //	WHERE s.cnpj = b.cnpj AND s.business_id IS NULL;
 type CSVExporter struct {
+	mu             sync.Mutex
 	businessPath   string
 	sociosPath     string
 	businessFile   *os.File
@@ -41,6 +43,11 @@ func NewCSVExporter(businessPath, sociosPath string) *CSVExporter {
 
 // Close flushes and closes the underlying CSV files.
 func (e *CSVExporter) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.businessWriter == nil && e.sociosWriter == nil {
+		return
+	}
 	if e.businessWriter != nil {
 		e.businessWriter.Flush()
 	}
@@ -53,6 +60,8 @@ func (e *CSVExporter) Close() {
 	if e.sociosFile != nil {
 		e.sociosFile.Close()
 	}
+	e.businessWriter, e.sociosWriter = nil, nil
+	e.businessFile, e.sociosFile = nil, nil
 }
 
 // Create is a no-op for CSV export.
@@ -63,6 +72,8 @@ func (e *CSVExporter) Drop() error { return nil }
 
 // PreLoad creates the CSV files and writes the headers.
 func (e *CSVExporter) PreLoad() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	var err error
 
 	e.businessFile, err = os.Create(e.businessPath)
@@ -111,6 +122,8 @@ func (e *CSVExporter) CreateCompanies(_ [][]string) error {
 // The batch format matches what the transform pipeline sends: each item is
 // [cnpj, jsonString].
 func (e *CSVExporter) CreateCompaniesStructured(batch [][]string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, record := range batch {
 		if len(record) < 2 {
 			slog.Warn("skipping invalid record", "record", record)
